@@ -202,6 +202,39 @@ export function sortSkillsByLoaded(skills: SkillSummary[], loaded: Set<string>):
   )
 }
 
+/** A successful invocation. The containing map supplies the historical message ID. */
+export interface SkillInvocation {
+  callID: string
+  skillID: string
+  agentID: string | null
+}
+
+/** Per-message snapshots, scoped to one session and its current compaction stage. */
+export type SkillUsage = ReadonlyMap<string, readonly SkillInvocation[]>
+
+export interface SkillLoadState {
+  loaded: Set<string>
+  compactionID?: string
+  /** Only collected when requested; preserves the existing load-only API. */
+  usage?: SkillUsage
+}
+
+/** Use the same success evidence for load marks and invocation counts. */
+function completedSkillID(entry: unknown): string | undefined {
+  const tool = entry as {
+    type?: unknown
+    name?: unknown
+    state?: { status?: unknown; content?: unknown; input?: { id?: unknown } }
+  } | null
+  if (
+    tool?.type !== "tool" || tool.name !== "skill" || tool.state?.status !== "completed" ||
+    typeof tool.state.input?.id !== "string" || !tool.state.input.id
+  ) return
+  if ((Array.isArray(tool.state.content) ? tool.state.content : []).some((part) =>
+    typeof part?.text === "string" && part.text.startsWith('<skill_content name="'),
+  )) return tool.state.input.id
+}
+
 /**
  * Exact skill IDs that a session message proves were loaded; display names
  * cannot identify a skill and must never be used as a fallback. OpenCode
@@ -217,33 +250,16 @@ export function extractMessageSkillLoads(message: unknown): string[] {
     skill?: unknown
     content?: unknown
     skills?: unknown
-  }
-  if (m.type === "assistant" && Array.isArray(m.content)) {
-    const ids: string[] = []
-    for (const entry of m.content) {
-      // Only completed tool entries count: running/streaming states have no
-      // output yet, and failed loads must not mark skills as loaded.
-      const s = entry as {
-        type?: unknown
-        name?: unknown
-        state?: { status?: unknown; content?: unknown; input?: { id?: unknown } }
-      }
-      if (
-        s.type !== "tool" || s.name !== "skill" || s.state?.status !== "completed" ||
-        typeof s.state.input?.id !== "string" || s.state.input.id.length === 0
-      ) continue
-      if ((Array.isArray(s.state.content) ? s.state.content : []).some((part) =>
-        typeof part?.text === "string" && part.text.startsWith('<skill_content name="'),
-      )) ids.push(s.state.input.id)
-    }
-    return ids
+  } | null
+  if (m?.type === "assistant" && Array.isArray(m.content)) {
+    return m.content.map(completedSkillID).filter((id): id is string => id !== undefined)
   }
   // Direct invocations (session.skill endpoint, TUI direct invocation) leave
   // a dedicated skill message: `skill` is the ID, `name` is the display name.
-  if (m.type === "skill" && typeof m.skill === "string" && m.skill.length > 0) {
+  if (m?.type === "skill" && typeof m.skill === "string" && m.skill.length > 0) {
     return [m.skill]
   }
-  if (m.type === "user" && Array.isArray(m.skills)) {
+  if (m?.type === "user" && Array.isArray(m.skills)) {
     return m.skills
       .map((attachment) => (attachment as { id?: unknown })?.id)
       .filter((id): id is string => typeof id === "string" && id.length > 0)
@@ -251,32 +267,94 @@ export function extractMessageSkillLoads(message: unknown): string[] {
   return []
 }
 
+/**
+ * Attribute calls to assistant.agent, never Session.agent. Missing identities
+ * cannot be counted safely; a missing historical agent is explicitly unknown.
+ * Built-in skill calls can have executed:false, so that flag is not a failure.
+ */
+function collectMessageUsage(
+  usage: Map<string, readonly SkillInvocation[]>, message: unknown, newestFirst = false,
+): void {
+  const m = message as { id?: unknown; type?: unknown; agent?: unknown; content?: unknown } | null
+  if (m?.type !== "assistant" || typeof m.id !== "string" || !m.id || !Array.isArray(m.content)) return
+  if (newestFirst && usage.has(m.id)) return
+  const calls = new Map<string, SkillInvocation>()
+  for (const entry of m.content) {
+    const skillID = completedSkillID(entry)
+    if (skillID === undefined || typeof entry?.id !== "string" || !entry.id) continue
+    calls.set(entry.id, {
+      callID: entry.id,
+      skillID,
+      agentID: typeof m.agent === "string" && m.agent.length > 0 ? m.agent : null,
+    })
+  }
+  // An empty snapshot can remove previously observed calls in this message.
+  usage.set(m.id, [...calls.values()])
+}
+
+/** Replace observed message snapshots; never increment counters on delivery. */
+export function mergeSkillUsage(previous: SkillUsage, incoming: SkillUsage): SkillUsage {
+  let next: Map<string, readonly SkillInvocation[]> | undefined
+  for (const [messageID, calls] of incoming) {
+    const old = previous.get(messageID) ?? []
+    if (old.length === calls.length && old.every((call, i) =>
+      call.callID === calls[i]!.callID && call.skillID === calls[i]!.skillID && call.agentID === calls[i]!.agentID,
+    )) continue
+    next ??= new Map(previous)
+    if (calls.length) next.set(messageID, calls)
+    else next.delete(messageID)
+  }
+  return next ?? previous
+}
+
+/** Shared sidebar/preview text. IDs remain distinct; unknown is not a guessed agent. */
+export function summarizeSkillUsage(usage?: SkillUsage): Map<string, string> {
+  const skills = new Map<string, Map<string | null, number>>()
+  for (const calls of usage?.values() ?? []) {
+    for (const call of calls) {
+      let agents = skills.get(call.skillID)
+      if (!agents) skills.set(call.skillID, agents = new Map())
+      agents.set(call.agentID, (agents.get(call.agentID) ?? 0) + 1)
+    }
+  }
+  return new Map([...skills].map(([id, agents]) => [id, [...agents]
+    .sort(([a, ac], [b, bc]) => Number(a === null) - Number(b === null) || bc - ac || (a ?? "").localeCompare(b ?? ""))
+    .map(([agent, count]) => `${agent ?? "Unknown agent"} ×${count}`)
+    .join(" · ")]))
+}
+
 /** Project an ascending message window; summary/recent text never proves a new load. */
-export function extractSkillLoadState(messages: readonly unknown[]): { loaded: Set<string>; compactionID?: string } {
+export function extractSkillLoadState(messages: readonly unknown[], trackUsage = false): SkillLoadState {
   const loaded = new Set<string>()
+  const usage = trackUsage ? new Map<string, readonly SkillInvocation[]>() : undefined
   let compactionID: string | undefined
   for (const message of messages) {
-    const entry = message as { id?: string; type?: unknown; status?: unknown }
-    if (entry.type === "compaction" && entry.status === "completed") {
+    const entry = message as { id?: string; type?: unknown; status?: unknown } | null
+    if (entry?.type === "compaction" && entry.status === "completed") {
       // ponytail: conservatively reset all loads; exact retained-skill tracking needs host support.
       loaded.clear()
+      usage?.clear()
       compactionID = entry.id
     }
     for (const id of extractMessageSkillLoads(message)) loaded.add(id)
+    if (usage) collectMessageUsage(usage, message)
   }
-  return { loaded, compactionID }
+  return { loaded, compactionID, ...(usage ? { usage } : {}) }
 }
 
 /**
  * Read newest-first history only as far as the last successful compaction.
  * Publish one snapshot so a late boundary cannot leave earlier loads marked.
+ * Usage shares this read; there is no additional history query or durable log.
  */
 export async function backfillLoadedSkills(
   ctx: Context,
   sessionID: string,
   signal?: AbortSignal,
-): Promise<ReturnType<typeof extractSkillLoadState> | undefined> {
+  trackUsage = false,
+): Promise<SkillLoadState | undefined> {
   const loaded = new Set<string>()
+  const usage = trackUsage ? new Map<string, readonly SkillInvocation[]>() : undefined
   let cursor: string | undefined | null
   do {
     if (signal?.aborted) return
@@ -290,12 +368,13 @@ export async function backfillLoadedSkills(
     if (signal?.aborted) return
     for (const message of page.data) {
       if (message.type === "compaction" && message.status === "completed") {
-        return { loaded, compactionID: message.id }
+        return { loaded, compactionID: message.id, ...(usage ? { usage } : {}) }
       }
       for (const id of extractMessageSkillLoads(message)) loaded.add(id)
+      if (usage) collectMessageUsage(usage, message, true)
     }
 
     cursor = page.cursor?.next
   } while (cursor)
-  return { loaded }
+  return { loaded, ...(usage ? { usage } : {}) }
 }

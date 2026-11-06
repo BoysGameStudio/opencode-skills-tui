@@ -15,6 +15,8 @@ export interface SkillsPanelProps {
   scope: Accessor<SkillDisplayMode>
   showState: Accessor<boolean>
   tokenMode: Accessor<SkillTokenMode>
+  showAgentUsage?: Accessor<boolean>
+  agentUsage?: Accessor<ReadonlyMap<string, string>>
   /** All IDs loaded in the current stage, including skills hidden from the model listing. */
   loadedIDs: Accessor<Set<string>>
   emptyMessage: Accessor<string>
@@ -91,6 +93,7 @@ export function SkillsPanel(props: SkillsPanelProps) {
         >
           <For each={displayedSkills()}>
             {(skill) => {
+              const usage = () => props.agentUsage?.().get(skill.id)
               const loaded = () => props.loadedIDs().has(skill.id)
               const color = () => loaded() ? loadedColor()
                 : skill.modelVisible === false ? props.theme().text.muted
@@ -106,31 +109,40 @@ export function SkillsPanel(props: SkillsPanelProps) {
               }
 
               return (
-                <box id={`skills-panel.${skill.id}`} width="100%" flexDirection="row" columnGap={1} onMouseUp={onRowMouseUp}>
-                  <text
-                    flexShrink={0}
-                    fg={color()}
-                  >
-                    {"•"}
-                  </text>
-                  {/* Numeric height resets flexShrink; restore it afterwards. */}
-                  <text
-                    flexGrow={1}
-                    minWidth={0}
-                    height={1}
-                    flexShrink={1}
-                    wrapMode="none"
-                    truncate
-                    fg={color()}
-                  >
-                    {skill.name ?? skill.id}
-                  </text>
-                  <Show when={props.tokenMode() !== "off"}>
-                    <text id={`skills-panel.${skill.id}.tokens`} width={tokenWidth()} height={1} flexShrink={0} textAlign="right" fg={props.theme().text.muted}>
-                      {tokenLabel(estimates().get(skill.id))}
+                <>
+                  <box id={`skills-panel.${skill.id}`} width="100%" flexDirection="row" columnGap={1} onMouseUp={onRowMouseUp}>
+                    <text
+                      flexShrink={0}
+                      fg={color()}
+                    >
+                      {"•"}
                     </text>
+                    {/* Numeric height resets flexShrink; restore it afterwards. */}
+                    <text
+                      flexGrow={1}
+                      minWidth={0}
+                      height={1}
+                      flexShrink={1}
+                      wrapMode="none"
+                      truncate
+                      fg={color()}
+                    >
+                      {skill.name ?? skill.id}
+                    </text>
+                    <Show when={props.tokenMode() !== "off"}>
+                      <text id={`skills-panel.${skill.id}.tokens`} width={tokenWidth()} height={1} flexShrink={0} textAlign="right" fg={props.theme().text.muted}>
+                        {tokenLabel(estimates().get(skill.id))}
+                      </text>
+                    </Show>
+                  </box>
+                  <Show when={props.showAgentUsage?.() && usage()}>
+                    {/* A sibling, not a child of the clickable row: no new mouse action. */}
+                    <box width="100%" paddingLeft={2} flexShrink={0}>
+                      <text id={`skills-panel.${skill.id}.agents`} content={usage() ?? ""} width="100%" height={1} flexShrink={0}
+                        wrapMode="none" truncate fg={props.theme().text.muted} />
+                    </box>
                   </Show>
-                </box>
+                </>
               )
             }}
           </For>

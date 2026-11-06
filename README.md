@@ -37,6 +37,7 @@ Run `/skills-sidebar` to open the settings panel.
 | Display scope | Choose which skills to show (see below) | `model-visible` / `registered` / `loaded-only` |
 | Token estimation | Show static token estimates | `list entry` / `load cost` / `total cost` / `off` |
 | Header counts | Show skill counts in the header | `on` / `off` |
+| Agent usage | Show per-agent invocation counts beneath each skill (default: `on`) | `on` / `off` |
 | Skill overview | Choose the mouse button for a read-only preview | `left-click` / `middle-click` / `right-click` / `off` |
 | Insert @mention | Choose the mouse button for inserting a native skill attachment into the prompt | `left-click` / `middle-click` / `right-click` / `off` |
 
@@ -68,6 +69,10 @@ Run `/skills-sidebar` to open the settings panel.
 Settings persist across sessions and restarts and sync across local TUI instances; collapse stays per-terminal.
 
 ## 💡 Notes
+
+- **Agent usage:** a line such as `unity-engineer ×3 · argus ×2` shows successful skill-tool calls by their historical invoking agents. Counts cover only the currently viewed session, since session start or the latest successful compaction; parent and child sessions are not combined. Repeated updates of the same call are counted once. Failed/unfinished calls, previews, and direct user attachments/activations do not add agent calls (their existing loaded-state behavior is unchanged). A missing historical agent is shown as `Unknown agent`; records without stable message/call IDs are not counted.
+
+  The sidebar line is informational and truncates to fit. The existing Skill overview popup shows the complete, wrapping breakdown in its `agents` metadata field. Turning **Agent usage** off hides only the sidebar line, not tracking or the preview field. Counts are rebuilt from available current-stage history after reopening; they are not a separate persistent log or proof that an agent is still following the instructions. Header counts remain distinct loaded skills, not calls. This fork feature requires a local build as described below; the upstream npm install command does not install unpublished fork changes.
 
 - **Unloaded after compaction:** OpenCode's context compaction (`/compact`) is [lossy](https://opencode.ai/v2/docs/compaction/) and does not guarantee continued adherence to skill instructions. Successful compaction resets load marks; a new successful load highlights the skill again. `loaded` counts distinct successfully loaded skills since session start or the latest successful compaction, not invocations. Unloaded does not mean all skill text is absent from context.
 - **Preview:** locally readable SKILL.md takes priority; otherwise the host's registered body is shown. Preview text may differ from model input. Colors follow the active theme, including changes while the preview is open; Markdown styling, text selection, and copying are preserved. Ctrl+click rendered HTTP(S) links to open them in your browser.

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs"
 import type { Plugin } from "@opencode/plugin/tui"
 import { CliRenderEvents, CodeRenderable, InputRenderable, SyntaxStyle, TextAttributes, isRenderable } from "@opentui/core"
 import type { MouseEvent, Renderable } from "@opentui/core"
-import { Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { Show, batch, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import type { Accessor } from "solid-js"
 import type { LocationRef } from "@opencode/client"
 import { useTerminalDimensions, useRenderer } from "@opentui/solid"
@@ -20,12 +20,16 @@ import {
   formatTokenCount,
   loadAvailableSkills,
   loadSkillFileSamples,
+  mergeSkillUsage,
+  summarizeSkillUsage,
   toSummaries,
   type SkillDisplayMode,
   type SkillSummary,
+  type SkillUsage,
 } from "./skill-data"
 
 const EMPTY_LOADED_SKILLS = new Set<string>()
+const EMPTY_SKILL_USAGE: SkillUsage = new Map()
 
 // shortcut: runtime imports of @opencode/plugin/tui or @opencode/client/solid load
 // @opencode/schema against the host binary's embedded effect, which broke on the
@@ -77,6 +81,7 @@ function SkillPreviewDialog(props: {
   ctx: Plugin.Context
   skill: SkillSummary
   raw?: string
+  agentUsage: Accessor<string | undefined>
   theme: Accessor<ResolvedTheme>
   renderer: {
     getLinkAt: (x: number, y: number) => string | null
@@ -185,6 +190,9 @@ function SkillPreviewDialog(props: {
         <text width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>
           {`path: ${source}`}
         </text>
+        <text id="skills-preview.agents" width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>
+          {`agents: ${props.agentUsage() || "-"}`}
+        </text>
         <box id="skills-preview.separator" width="100%" flexShrink={0} marginBottom={1}
           onSizeChange={function () { setSeparatorWidth(this.width) }}>
           <text content={separator()} width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC} />
@@ -209,7 +217,7 @@ export default definePlugin({
   setup(ctx) {
     // Keep collapse per-terminal. Old in-memory settings seed the durable store on reload.
     const [ui, mutateUI] = ctx.storage.memory<Omit<SkillsSiderSettings, "token"> & { token: SkillsSiderSettings["token"] | "metadata" | "instructions"; collapsed: boolean; displayMode?: SkillDisplayMode }>("prefs", {
-      initial: { collapsed: false, switch: "on", scope: "model", preview: "left-click", mention: "right-click", token: "off", state: "on" },
+      initial: { collapsed: false, switch: "on", scope: "model", preview: "left-click", mention: "right-click", token: "off", state: "on", usage: "on" },
     })
     const normalizeSettings = (value: Omit<typeof ui, "collapsed">): SkillsSiderSettings => ({
       switch: value.switch ?? "on",
@@ -218,6 +226,7 @@ export default definePlugin({
       mention: value.mention ?? "right-click",
       token: value.token === "metadata" ? "listing" : value.token === "instructions" ? "load-delta" : value.token ?? "off",
       state: value.state ?? "on",
+      usage: value.usage ?? "on",
     })
     const [prefs, mutatePrefs] = ctx.storage.store<Omit<typeof ui, "collapsed">>("settings", {
       initial: normalizeSettings(ui),
@@ -241,6 +250,7 @@ export default definePlugin({
     }
 
     const [loadedBySession, setLoadedBySession] = createSignal(new Map<string, Set<string>>())
+    const [usageBySession, setUsageBySession] = createSignal(new Map<string, SkillUsage>())
     const [fileSamples, setFileSamples] = createSignal(new Map<string, readonly string[] | undefined>())
     const sampling = new Map<string, AbortController>()
     const backfilled = new Set<string>()
@@ -300,6 +310,12 @@ export default definePlugin({
       backfilling.get(sessionID)?.abort()
       backfilling.delete(sessionID)
       backfilled.delete(sessionID)
+      setUsageBySession((current) => {
+        if (!current.has(sessionID)) return current
+        const next = new Map(current)
+        next.delete(sessionID)
+        return next
+      })
       setLoadedBySession((current) => {
         if (!current.has(sessionID)) return current
         const next = new Map(current)
@@ -315,6 +331,14 @@ export default definePlugin({
         resetLoaded(sessionID)
       }
       for (const id of state.loaded) markLoaded(sessionID, id)
+      if (state.usage) {
+        const incoming = state.usage
+        setUsageBySession((current) => {
+          const previous = current.get(sessionID) ?? EMPTY_SKILL_USAGE
+          const next = mergeSkillUsage(previous, incoming)
+          return next === previous ? current : new Map(current).set(sessionID, next)
+        })
+      }
     }
 
     const ensureBackfill = (sessionID: string) => {
@@ -325,13 +349,16 @@ export default definePlugin({
 
       const controller = new AbortController()
       backfilling.set(sessionID, controller)
-      void backfillLoadedSkills(ctx, sessionID, controller.signal)
+      void backfillLoadedSkills(ctx, sessionID, controller.signal, true)
         .then((state) => {
           if (disposed || controller.signal.aborted || !state) return
           // Detach this read before a newly discovered boundary invalidates older reads.
           backfilling.delete(sessionID)
-          applyLoads(sessionID, state)
-          applyLoads(sessionID, extractSkillLoadState(ctx.data.session.message.list(sessionID)))
+          batch(() => {
+            applyLoads(sessionID, state)
+            // Live snapshots win over an older version of the same history message.
+            applyLoads(sessionID, extractSkillLoadState(ctx.data.session.message.list(sessionID), true))
+          })
           backfilled.add(sessionID)
         })
         .catch(() => {
@@ -348,7 +375,7 @@ export default definePlugin({
       })
     }
 
-    const renderSkillPreview = (skill: SkillSummary, location: LocationRef) => {
+    const renderSkillPreview = (skill: SkillSummary, location: LocationRef, sessionID: string) => {
       // Read the SKILL.md from disk and render it verbatim; normalize CRLF so
       // Windows line endings can't leak into the rendered lines. Unreadable
       // files fall back to the stripped server content.
@@ -361,10 +388,11 @@ export default definePlugin({
         }
       }
       const previewSkill = createMemo(() => ({ ...skill, fileSamples: fileSamples().get(sampleKey(skill, location)) }))
-      return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} theme={() => ctx.theme} renderer={ctx.renderer} />
+      const agentUsage = createMemo(() => summarizeSkillUsage(usageBySession().get(sessionID)).get(skill.id))
+      return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} agentUsage={agentUsage} theme={() => ctx.theme} renderer={ctx.renderer} />
     }
 
-    const openSkillPreview = (skill: SkillSummary, location: LocationRef) => {
+    const openSkillPreview = (skill: SkillSummary, location: LocationRef, sessionID: string) => {
       ensureFileSamples(skill, location, true)
       // The host backdrop swallows the first dismiss click while a selection
       // exists (mousedown sets dismiss=!!getSelection()), so a zero-width
@@ -372,7 +400,7 @@ export default definePlugin({
       // click outside twice. Clear it before the dialog mounts.
       ctx.renderer.clearSelection()
       // dialog.set() targets the active dialog, so show it first.
-      ctx.ui.dialog.show(() => renderSkillPreview(skill, location))
+      ctx.ui.dialog.show(() => renderSkillPreview(skill, location, sessionID))
       ctx.ui.dialog.set({ size: "xlarge", centered: true })
     }
 
@@ -455,7 +483,7 @@ export default definePlugin({
       const sessionID = event.data.sessionID
       if (disposed || deletedSessions.has(sessionID)) return
       // The host projects ended events into completed messages, even for inactive sessions.
-      const state = extractSkillLoadState(ctx.data.session.message.list(sessionID))
+      const state = extractSkillLoadState(ctx.data.session.message.list(sessionID), true)
       if (state.compactionID) applyLoads(sessionID, state)
       else resetLoaded(sessionID)
       ensureBackfill(sessionID)
@@ -598,6 +626,7 @@ export default definePlugin({
           // Read directory/workspace fields so moving the same Session also syncs.
           void refreshSkills({ directory: location.directory, workspaceID: location.workspaceID })
         })
+        const agentUsage = createMemo(() => summarizeSkillUsage(usageBySession().get(input.sessionID)))
         const panel = createMemo(() => skillsView(input.sessionID, settings().scope, loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS))
         createEffect(() => {
           const location = session()?.location
@@ -609,7 +638,7 @@ export default definePlugin({
         // Slot renders run once, untracked. Effects follow its reactive Session
         // input and the message window instead of relying on claim re-renders.
         createEffect(() => {
-          applyLoads(input.sessionID, extractSkillLoadState(ctx.data.session.message.list(input.sessionID)))
+          applyLoads(input.sessionID, extractSkillLoadState(ctx.data.session.message.list(input.sessionID), true))
           ensureBackfill(input.sessionID)
         })
 
@@ -621,6 +650,8 @@ export default definePlugin({
             scope={() => settings().scope}
             showState={() => settings().state === "on"}
             tokenMode={() => settings().token}
+            showAgentUsage={() => settings().usage === "on"}
+            agentUsage={agentUsage}
             emptyMessage={() => panel().emptyMessage}
             loadedIDs={() => loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS}
             theme={() => ctx.theme}
@@ -633,7 +664,7 @@ export default definePlugin({
                 const location = session()?.location
                 if (location) insertSkill(skill, location)
               } else if (settings().preview === click) {
-                openSkillPreview(skill, session()?.location ?? ctx.location ?? ctx.data.location.default())
+                openSkillPreview(skill, session()?.location ?? ctx.location ?? ctx.data.location.default(), input.sessionID)
               }
             }}
           /></Show>
