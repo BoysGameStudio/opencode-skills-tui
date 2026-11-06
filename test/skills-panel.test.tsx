@@ -439,7 +439,7 @@ test("collapsing stays per-terminal instead of syncing across TUI instances", as
             setSharedDurable(produce(mutation))
           }]
         },
-        memory: () => [memoryState, (mutation: (draft: object) => void) => setState(produce(mutation))],
+        memory: () => [memoryState, (mutation: (draft: object) => void) => setMemoryState(produce(mutation))],
       },
       skills: () => [{ id: "alpha", name: "alpha", description: "Alpha", content: "# Alpha" }],
       slot: (options) => {
