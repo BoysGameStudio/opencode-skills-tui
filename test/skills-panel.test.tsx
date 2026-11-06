@@ -33,7 +33,7 @@ const makeContext = (overrides: {
   skillSync?: (location: any) => Promise<void>
   agentSync?: (location: any) => Promise<void>
   session?: (sessionID: string) => any
-  agents?: (location: any) => any[] | undefined
+  agents?: (location?: any) => any[] | undefined
   messageList?: (input: any) => Promise<any>
   fileList?: (input: any, options?: any) => Promise<any>
   toastShow?: (options: any) => void
@@ -284,7 +284,7 @@ async function withSider(
     open()
     await view.waitForFrame((frame) => frame.includes("Skills Sidebar"))
     view.mockInput.pressKey("HOME")
-    const index = ["switch", "scope", "token", "state", "preview", "mention"].indexOf(setting)
+    const index = ["switch", "scope", "token", "state", "usage", "preview", "mention"].indexOf(setting)
     expect(index).toBeGreaterThanOrEqual(0)
     for (let i = 0; i < index; i++) view.mockInput.pressArrow("down")
     if (direction === "enter") view.mockInput.pressEnter()
@@ -439,7 +439,7 @@ test("collapsing stays per-terminal instead of syncing across TUI instances", as
             setSharedDurable(produce(mutation))
           }]
         },
-        memory: () => [memoryState, (mutation: (draft: object) => void) => setMemoryState(produce(mutation))],
+        memory: () => [memoryState, (mutation: (draft: object) => void) => setState(produce(mutation))],
       },
       skills: () => [{ id: "alpha", name: "alpha", description: "Alpha", content: "# Alpha" }],
       slot: (options) => {
@@ -503,6 +503,7 @@ test("preview dialog renders wrapped description and body without title or overl
       expect(frame.split("\n")[0].trim()).toBe("id: find-skills")
       expect(frame.split("\n")[1].trim()).toBe(previewStatsLabel(195, skill))
       expect(frame.split("\n")[2].trim()).toBe("path: -")
+      expect(frame.split("\n")[3].trim()).toBe("agents: -")
       expect(frame).toContain("Helps users discover and install agent skills")
       expect(frame).toContain("Find Skills")
       expect(frame).toContain("Body paragraph.")
@@ -602,8 +603,8 @@ for (const initialMode of ["light", "dark"] as const) {
           }
           await waitForMarkdown(dialogView)
           await dialogView.flush()
-          const samples = ["id: alpha", "stats:", "path:", "provided by plugin", "Paragraph", "inline", "link", "Heading", "Quote", "Item", "Code block", "Cell", "CellCode"]
-          const foreground = (text: string) => /id:|stats:|path:|provided by plugin/.test(text) ? palette().muted
+          const samples = ["id: alpha", "stats:", "path:", "agents:", "provided by plugin", "Paragraph", "inline", "link", "Heading", "Quote", "Item", "Code block", "Cell", "CellCode"]
+          const foreground = (text: string) => /id:|stats:|path:|agents:|provided by plugin/.test(text) ? palette().muted
             : text === "inline" || text === "CellCode" ? palette().code : text === "link" ? palette().link : palette().text
           const spans = () => dialogView.captureSpans().lines.flatMap((line) => line.spans)
           for (const text of samples) {
@@ -685,23 +686,24 @@ test("overview plugin data is italic and separated from the raw SKILL.md without
         expect(rows[0]).toBe("id: find-skills")
         expect(rows[1]).toBe(previewStatsLabel(110, skill))
         expect(rows[2]).toBe(`path: ${skillPath}`)
-        expect(rows[3]).toMatch(/^-+ provided by plugin -{7}$/)
-        expect(rows[4]).toBe("")
-        expect(rows[5]).toBe("name: find-skills")
-        const headerSpans = () => dialogView.captureSpans().lines.slice(0, 4).flatMap((line) => line.spans)
-          .filter((span) => /id:|stats:|path:|provided by plugin/.test(span.text))
+        expect(rows[3]).toBe("agents: -")
+        expect(rows[4]).toMatch(/^-+ provided by plugin -{7}$/)
+        expect(rows[5]).toBe("")
+        expect(rows[6]).toBe("name: find-skills")
+        const headerSpans = () => dialogView.captureSpans().lines.slice(0, 5).flatMap((line) => line.spans)
+          .filter((span) => /id:|stats:|path:|agents:|provided by plugin/.test(span.text))
         const headerColors = () => headerSpans().map((span) => span.fg.equals(mutedColor()))
-        expect(headerColors()).toEqual([true, true, true, true])
-        expect(headerSpans().map((span) => (span.attributes & TextAttributes.ITALIC) !== 0)).toEqual([true, true, true, true])
-        const bodySpans = dialogView.captureSpans().lines.slice(5).flatMap((line) => line.spans)
+        expect(headerColors()).toEqual([true, true, true, true, true])
+        expect(headerSpans().map((span) => (span.attributes & TextAttributes.ITALIC) !== 0)).toEqual([true, true, true, true, true])
+        const bodySpans = dialogView.captureSpans().lines.slice(6).flatMap((line) => line.spans)
           .filter((span) => /name: find-skills|Body paragraph\./.test(span.text))
         expect(bodySpans.map((span) => (span.attributes & TextAttributes.ITALIC) !== 0)).toEqual([false, false])
         setColor(cyan)
         await dialogView.flush()
-        expect(headerColors()).toEqual([true, true, true, true])
+        expect(headerColors()).toEqual([true, true, true, true, true])
         setMutedColor(RGBA.fromHex("#6f767e"))
         await dialogView.flush()
-        expect(headerColors()).toEqual([true, true, true, true])
+        expect(headerColors()).toEqual([true, true, true, true, true])
         // The raw file renders verbatim: frontmatter labels visible, no
         // injected title, and the `---` fences never become a rule line.
         expect(frame).toContain("name: find-skills")
@@ -758,13 +760,16 @@ test.each([
       const rows = dialogView.captureCharFrame().split("\n").map((line) => line.trim())
       const nameRow = rows.indexOf("name: opencode")
       const pathRow = rows.findIndex((line) => line.startsWith("path:"))
+      const agentsRow = rows.findIndex((line) => line.startsWith("agents:"))
       const separatorRow = rows.findIndex((line) => line.includes("provided by plugin"))
       expect(rows[0]).toBe("id: opencode")
       expect(rows.slice(1, pathRow).join("").replace(/\s/g, "")).toBe(previewStatsLabel(31, skill).replace(/\s/g, ""))
-      expect(rows.slice(pathRow, separatorRow).join("")).toBe(`path: ${path || "-"}`)
+      expect(agentsRow).toBeGreaterThan(pathRow)
+      expect(rows.slice(pathRow, agentsRow).join("")).toBe(`path: ${path || "-"}`)
+      expect(rows.slice(agentsRow, separatorRow).join("")).toBe("agents: -")
       expect(separatorRow).toBe(nameRow - 2)
       expect(rows[nameRow - 1]).toBe("")
-      expect(nameRow).toBeGreaterThanOrEqual(5)
+      expect(nameRow).toBeGreaterThanOrEqual(6)
       expect(rows).toContain("Body paragraph.")
     } finally { dialogView.renderer.destroy() }
   }, { width: 50, height: 24 })
@@ -2154,8 +2159,9 @@ test.each([
       expect(rows[1].trimStart()).toStartWith("stats: chars ")
       expect(rows[1]).not.toMatch(/chars:|list entry:|load cost:|total cost:/)
       expect(rows[2]).toContain("path: -")
-      expect(rows[3].trim()).toMatch(/^-+ provided by plugin -{7}$/)
-      expect(rows[4].trim()).toBe("")
+      expect(rows[3].trim()).toBe("agents: -")
+      expect(rows[4].trim()).toMatch(/^-+ provided by plugin -{7}$/)
+      expect(rows[5].trim()).toBe("")
       const statistics = dialogView.captureSpans().lines[1].spans.find((span) => span.text.includes("stats:"))!
       expect(statistics.text.trim()).toBe(label)
       expect(statistics.fg.equals(context.theme.text.muted)).toBe(true)
@@ -2272,8 +2278,8 @@ test.each([false, true])("Skills Sidebar groups clear setting labels without sea
     expect(frame).toContain("Mouse actions")
     const rows = frame.split("\n").map((line) => line.trim())
     expect(rows.filter((line) => ["Settings", "Sidebar Display", "Mouse actions"].includes(line))).toEqual(["Sidebar Display", "Mouse actions"])
-    expect(rows.slice(rows.indexOf("Sidebar Display") + 1, rows.indexOf("Sidebar Display") + 5).map((line) => line.split(/\s{2,}/)[0]))
-      .toEqual(["Show sidebar", "Display scope", "Token estimation", "Header counts"])
+    expect(rows.slice(rows.indexOf("Sidebar Display") + 1, rows.indexOf("Sidebar Display") + 6).map((line) => line.split(/\s{2,}/)[0]))
+      .toEqual(["Show sidebar", "Display scope", "Token estimation", "Header counts", "Agent usage"])
     expect(frame).not.toMatch(/Skills Sider|Cursor Actions|Loaded total|\b(switch|state)\b/)
     expect(frame.split("\n").find((line) => line.includes("↑/↓"))!.indexOf("↑"))
       .toBe(frame.split("\n").find((line) => line.trim() === "Sidebar Display")!.indexOf("Sidebar Display"))
@@ -2283,7 +2289,7 @@ test.each([false, true])("Skills Sidebar groups clear setting labels without sea
     }
     expect(frame).not.toContain("ctrl+o")
     expect(frame).not.toContain("• One")
-    for (const [key, value] of [["Show sidebar", "on"], ["Display scope", "model-visible"], ["Token estimation", "off"], ["Header counts", "on"], ["Skill overview", "left-click"], ["Insert @mention", "right-click"]]) {
+    for (const [key, value] of [["Show sidebar", "on"], ["Display scope", "model-visible"], ["Token estimation", "off"], ["Header counts", "on"], ["Agent usage", "on"], ["Skill overview", "left-click"], ["Insert @mention", "right-click"]]) {
       const row = frame.split("\n").find((line) => line.trim().startsWith(key))!
       expect(row.trimEnd().endsWith(value)).toBe(true)
     }
@@ -2314,7 +2320,7 @@ test.each([false, true])("Skills Sidebar groups clear setting labels without sea
     host.open()
     await view.waitForFrame((frame) => /Skill overview\s+middle-click/.test(frame) && /Insert @mention\s+off/.test(frame))
     view.mockInput.pressKey("HOME")
-    for (let i = 0; i < 4; i++) view.mockInput.pressArrow("down")
+    for (let i = 0; i < 5; i++) view.mockInput.pressArrow("down")
     for (const label of ["right-click", "off", "left-click", "middle-click"]) {
       view.mockInput.pressEnter()
       await view.waitForFrame((frame) => new RegExp(`Skill overview\\s+${label}`).test(frame))
@@ -2602,7 +2608,7 @@ test("grouped settings keep values aligned and keyboard selection visible in sho
   await withSider(makeContext(), async (view, host) => {
     host.open()
     await view.waitForFrame((frame) => frame.includes("model-visible"))
-    for (const key of ["switch", "scope", "preview", "mention", "token", "state"]) {
+    for (const key of ["switch", "scope", "preview", "mention", "token", "state", "usage"]) {
       const row = view.renderer.root.findDescendantById(`skills-sider.${key}`)!
       const [label, value] = row.getChildren()
       expect(value.x).toBeGreaterThanOrEqual(label.x + label.width + 1)
@@ -2879,7 +2885,7 @@ test("cancelled native mention releases the frame wait without inserting or send
 test("Skills Sidebar settings persist across sessions and restarts without saving collapse state", async () => {
   const directory = mkdtempSync(join(tmpdir(), "skills-settings-"))
   const [sessionID, setSessionID] = createSignal("session-1")
-  const expected = { switch: "off", scope: "registered", token: "listing", state: "off", preview: "middle-click", mention: "off" }
+  const expected = { switch: "off", scope: "registered", token: "listing", state: "off", usage: "off", preview: "middle-click", mention: "off" }
   const terminal = () => makeContext({
     skills: () => [{ id: "one", name: "One", description: "One" }],
     session: (id) => ({ agent: "build", location: { directory: id } }),
@@ -2906,6 +2912,7 @@ test("Skills Sidebar settings persist across sessions and restarts without savin
       await host.change("scope")
       await host.change("token")
       await host.change("state")
+      await host.change("usage")
       await host.change("preview")
       await host.change("mention")
       await host.change("switch")
@@ -2915,6 +2922,7 @@ test("Skills Sidebar settings persist across sessions and restarts without savin
       host.open()
       await view.waitForFrame((frame) => /Show sidebar\s+off/.test(frame) && /Display scope\s+registered/.test(frame))
       expect(view.captureCharFrame()).toMatch(/Skill overview\s+middle-click/)
+      expect(view.captureCharFrame()).toMatch(/Agent usage\s+off/)
       expect(host.draft.skills).toEqual([])
       expect(host.submits()).toBe(0)
       expect(JSON.parse(readFileSync(join(directory, "settings.json"), "utf8"))).toEqual(expected)
@@ -2929,7 +2937,7 @@ test("Skills Sidebar settings persist across sessions and restarts without savin
     await withSider(terminal(), async (view, host) => {
       host.open()
       await view.waitForFrame((frame) => /Display scope\s+loaded-only/.test(frame))
-      for (const pattern of [/Show sidebar\s+off/, /Token estimation\s+list entry/, /Header counts\s+off/, /Skill overview\s+middle-click/, /Insert @mention\s+off/]) {
+      for (const pattern of [/Show sidebar\s+off/, /Token estimation\s+list entry/, /Header counts\s+off/, /Agent usage\s+off/, /Skill overview\s+middle-click/, /Insert @mention\s+off/]) {
         expect(view.captureCharFrame()).toMatch(pattern)
       }
       await host.escape()
