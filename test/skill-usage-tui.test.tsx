@@ -11,21 +11,21 @@ const { default: plugin } = await import(process.env.PLUGIN_TEST_ENTRY ?? "../sr
 const white = RGBA.fromHex("#ffffff")
 const gray = RGBA.fromHex("#888888")
 const skill = { id: "ui", name: "UI", description: "UI instructions", content: "Keep the existing interface." }
-const message = (id: string, agent: string, count = 1) => ({
-  id, type: "assistant", agent, time: { created: 1 },
+const message = (id: string, agent: string, count = 1, created = 1) => ({
+  id, type: "assistant", agent, time: { created },
   content: Array.from({ length: count }, (_, i) => ({
     type: "tool", id: `call-${i}`, name: "skill", executed: false,
     state: { status: "completed", input: { id: "ui" }, content: [{ type: "text", text: '<skill_content name="UI">\nInstructions' }] },
-    time: { created: 1, completed: 2 },
+    time: { created, completed: created + 1 },
   })),
 })
 
 /** Minimal host using the same rendered-test primitives as the existing suite. */
 async function withUsage(
   check: (view: Awaited<ReturnType<typeof testRender>>, host: any) => Promise<void>,
-  options: { width?: number; history?: (input: any) => Promise<any>; prefs?: Record<string, unknown> } = {},
+  options: { width?: number; history?: (input: any) => Promise<any>; prefs?: Record<string, unknown>; initialMessages?: Record<string, any[]> } = {},
 ) {
-  const [messages, setMessages] = createSignal<Record<string, any[]>>({ s1: [message("m1", "unity-engineer", 3), message("m2", "argus", 2)], s2: [message("m1", "other-agent")] })
+  const [messages, setMessages] = createSignal<Record<string, any[]>>(options.initialMessages ?? { s1: [message("m1", "unity-engineer", 3), message("m2", "argus", 2)], s2: [message("m1", "other-agent")] })
   const [selected, select] = createSignal("s1")
   const [dialog, setDialog] = createSignal<(() => any) | undefined>()
   const [themeMode, setThemeMode] = createSignal("dark")
@@ -213,4 +213,94 @@ test("narrow rows truncate usage independently and keep the original token colum
     await view.flush()
     assert.ok(view.renderer.root.findDescendantById("skills-panel.ui.tokens"))
   }, { width: 28, prefs: { token: "listing" } })
+})
+
+test("history-discovered compaction cannot be undone by a stale cached stage", async () => {
+  let requests = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("new-agent ×1"))
+    assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
+    host.setMessages("s1", [
+      { id: "c1", type: "compaction", status: "completed", time: { created: 10 } },
+      message("before", "old-agent", 3, 15),
+    ])
+    await view.flush()
+    assert.match(view.captureCharFrame(), /new-agent ×1/)
+    assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
+    assert.equal(requests, 1)
+  }, {
+    initialMessages: { s1: [
+      { id: "c1", type: "compaction", status: "completed", time: { created: 10 } },
+      message("before", "old-agent", 3, 15),
+    ] },
+    history: async () => {
+      requests++
+      return { data: [message("after", "new-agent", 1, 30),
+        { id: "c2", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} }
+    },
+  })
+})
+
+test("a marker-less stale cache cannot restore pre-compaction usage", async () => {
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("new-agent ×1"))
+    assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
+  }, {
+    initialMessages: { s1: [message("before", "old-agent", 3, 15)] },
+    history: async () => ({ data: [message("after", "new-agent", 1, 30),
+      { id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} }),
+  })
+})
+
+test("late history preserves live updates that have left the current message window", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×3"))
+    host.setMessages("s1", [message("m1", "unity-engineer", 4), message("m2", "argus", 2)])
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×4"))
+    host.setMessages("s1", [message("m2", "argus", 2)])
+    await view.flush()
+    pending.resolve({ data: [message("m2", "argus", 2), message("m1", "unity-engineer", 3)], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.match(view.captureCharFrame(), /unity-engineer ×4 · argus ×2/)
+  }, { history: () => pending.promise })
+})
+
+test("late history cannot resurrect an emptied message after it leaves the live window", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×3"))
+    host.setMessages("s1", [message("m1", "unity-engineer", 0), message("m2", "argus", 2)])
+    await view.waitForFrame((frame) => !frame.includes("unity-engineer") && frame.includes("argus ×2"))
+    host.setMessages("s1", [message("m2", "argus", 2)])
+    await view.flush()
+    pending.resolve({ data: [message("m2", "argus", 2), message("m1", "unity-engineer", 3)], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.doesNotMatch(view.captureCharFrame(), /unity-engineer/)
+    assert.match(view.captureCharFrame(), /argus ×2/)
+  }, { history: () => pending.promise })
+})
+
+test("unchanged cached snapshots cannot overwrite fresher history on a later update", async () => {
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×4"))
+    host.setMessages("s1", [message("m1", "unity-engineer", 3), message("m2", "argus", 2), message("m3", "argus")])
+    await view.waitForFrame((frame) => frame.includes("argus ×3"))
+    assert.match(view.captureCharFrame(), /unity-engineer ×4/)
+  }, { history: async () => ({ data: [message("m2", "argus", 2), message("m1", "unity-engineer", 4)], cursor: {} }) })
+})
+
+test("deleting a session discards both counts and an in-flight history response", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×3"))
+    host.events.get("session.deleted")({ data: { sessionID: "s1" } })
+    await view.flush()
+    pending.resolve({ data: [message("m1", "unity-engineer", 3)], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
+  }, { history: () => pending.promise })
 })

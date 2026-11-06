@@ -21,11 +21,13 @@ import {
   loadAvailableSkills,
   loadSkillFileSamples,
   mergeSkillUsage,
+  messagesAfterSkillCompaction,
   summarizeSkillUsage,
   toSummaries,
   type SkillDisplayMode,
   type SkillSummary,
   type SkillUsage,
+  type SkillInvocation,
 } from "./skill-data"
 
 const EMPTY_LOADED_SKILLS = new Set<string>()
@@ -251,14 +253,17 @@ export default definePlugin({
 
     const [loadedBySession, setLoadedBySession] = createSignal(new Map<string, Set<string>>())
     const [usageBySession, setUsageBySession] = createSignal(new Map<string, SkillUsage>())
+    const observedUsageBySession = new Map<string, SkillUsage>()
     const [fileSamples, setFileSamples] = createSignal(new Map<string, readonly string[] | undefined>())
     const sampling = new Map<string, AbortController>()
     const backfilled = new Set<string>()
     const backfilling = new Map<string, AbortController>()
+    const backfillUsage = new Map<string, Map<string, readonly SkillInvocation[]>>()
     const [refreshByLocation, setRefreshByLocation] = createSignal(
       new Map<string, { id: number; failure?: { skills: unknown; agents: unknown } }>(),
     )
     const compactionBySession = new Map<string, string>()
+    const compactionTimeBySession = new Map<string, number>()
     const deletedSessions = new Set<string>()
     let disposed = false
     let refreshID = 0
@@ -309,6 +314,7 @@ export default definePlugin({
     const resetLoaded = (sessionID: string) => {
       backfilling.get(sessionID)?.abort()
       backfilling.delete(sessionID)
+      backfillUsage.delete(sessionID)
       backfilled.delete(sessionID)
       setUsageBySession((current) => {
         if (!current.has(sessionID)) return current
@@ -324,17 +330,49 @@ export default definePlugin({
       })
     }
 
-    const applyLoads = (sessionID: string, state: ReturnType<typeof extractSkillLoadState>) => {
+    const liveLoadState = (sessionID: string) => {
+      const id = compactionBySession.get(sessionID)
+      const messages = messagesAfterSkillCompaction(ctx.data.session.message.list(sessionID),
+        id ? { id, created: compactionTimeBySession.get(sessionID) } : undefined)
+      return extractSkillLoadState(messages, true)
+    }
+
+    const applyLoads = (sessionID: string, state: ReturnType<typeof extractSkillLoadState>, fromHistory = false) => {
       if (disposed || deletedSessions.has(sessionID)) return
+      let resetStage = false
       if (state.compactionID && state.compactionID !== compactionBySession.get(sessionID)) {
+        const currentTime = compactionTimeBySession.get(sessionID)
+        if (currentTime !== undefined && state.compactionTime !== undefined && state.compactionTime < currentTime) return
         compactionBySession.set(sessionID, state.compactionID)
+        compactionTimeBySession.delete(sessionID)
+        if (state.compactionTime !== undefined) compactionTimeBySession.set(sessionID, state.compactionTime)
         resetLoaded(sessionID)
+        resetStage = true
+        // Keep already observed snapshots only when they belong to the new stage.
+        // Forgetting them would make an unchanged stale cache look like an update.
+        const valid = new Set(state.usage?.keys() ?? [])
+        const observed = observedUsageBySession.get(sessionID) ?? EMPTY_SKILL_USAGE
+        observedUsageBySession.set(sessionID, new Map([...observed].filter(([id]) => valid.has(id))))
       }
+      if (state.compactionID && state.compactionTime !== undefined) compactionTimeBySession.set(sessionID, state.compactionTime)
       for (const id of state.loaded) markLoaded(sessionID, id)
       if (state.usage) {
-        const incoming = state.usage
+        let incoming = state.usage
+        if (!fromHistory) {
+          const previous = observedUsageBySession.get(sessionID) ?? EMPTY_SKILL_USAGE
+          const observed = mergeSkillUsage(previous, incoming)
+          // A repeated cache snapshot is not newer evidence than a history read.
+          if (!resetStage) incoming = new Map([...incoming].filter(([id]) => observed.get(id) !== previous.get(id)))
+          observedUsageBySession.set(sessionID, observed)
+          // Retain actual changes during this read even if their messages later
+          // leave the live window. Empty arrays are deliberate replacements.
+          const overlay = backfillUsage.get(sessionID)
+          if (overlay) for (const [id, calls] of incoming) overlay.set(id, calls)
+        }
         setUsageBySession((current) => {
           const previous = current.get(sessionID) ?? EMPTY_SKILL_USAGE
+          // Replace snapshots by identity. Absence from a page/window alone is
+          // not evidence that a previously observed live message was deleted.
           const next = mergeSkillUsage(previous, incoming)
           return next === previous ? current : new Map(current).set(sessionID, next)
         })
@@ -348,24 +386,41 @@ export default definePlugin({
       ) return
 
       const controller = new AbortController()
+      const overlay = new Map<string, readonly SkillInvocation[]>()
+      const stage = compactionBySession.get(sessionID)
       backfilling.set(sessionID, controller)
+      backfillUsage.set(sessionID, overlay)
       void backfillLoadedSkills(ctx, sessionID, controller.signal, true)
         .then((state) => {
-          if (disposed || controller.signal.aborted || !state) return
+          if (disposed || controller.signal.aborted || !state || backfilling.get(sessionID) !== controller) return
           // Detach this read before a newly discovered boundary invalidates older reads.
           backfilling.delete(sessionID)
+          backfillUsage.delete(sessionID)
           batch(() => {
-            applyLoads(sessionID, state)
-            // Live snapshots win over an older version of the same history message.
-            applyLoads(sessionID, extractSkillLoadState(ctx.data.session.message.list(sessionID), true))
+            // Only post-request live changes in the same stage override history.
+            // This also preserves replacements no longer in the live window.
+            const currentMessages = ctx.data.session.message.list(sessionID)
+            const verifiedLive = extractSkillLoadState(messagesAfterSkillCompaction(currentMessages,
+              state.compactionID ? { id: state.compactionID, created: state.compactionTime } : undefined), true)
+            const valid = new Set([...(state.usage?.keys() ?? []), ...(verifiedLive.usage?.keys() ?? [])])
+            const changes = state.compactionID === stage ? overlay
+              : new Map([...overlay].filter(([id]) => valid.has(id)))
+            const usage = state.usage ? mergeSkillUsage(state.usage, changes) : undefined
+            applyLoads(sessionID, { ...state, usage }, true)
+            // Do not replay a stale cache across a newer boundary found in history.
+            applyLoads(sessionID, liveLoadState(sessionID))
+            // Set before batch flush, so reactive effects cannot start a second read.
+            backfilled.add(sessionID)
           })
-          backfilled.add(sessionID)
         })
         .catch(() => {
           // History unreachable: live message scans still mark loads.
         })
         .finally(() => {
-          if (backfilling.get(sessionID) === controller) backfilling.delete(sessionID)
+          if (backfilling.get(sessionID) === controller) {
+            backfilling.delete(sessionID)
+            backfillUsage.delete(sessionID)
+          }
         })
     }
 
@@ -477,13 +532,15 @@ export default definePlugin({
       deletedSessions.add(sessionID)
       resetLoaded(sessionID)
       compactionBySession.delete(sessionID)
+      compactionTimeBySession.delete(sessionID)
+      observedUsageBySession.delete(sessionID)
     })
 
     const unregisterCompactionEnded = ctx.data.on("session.compaction.ended", (event) => {
       const sessionID = event.data.sessionID
       if (disposed || deletedSessions.has(sessionID)) return
       // The host projects ended events into completed messages, even for inactive sessions.
-      const state = extractSkillLoadState(ctx.data.session.message.list(sessionID), true)
+      const state = liveLoadState(sessionID)
       if (state.compactionID) applyLoads(sessionID, state)
       else resetLoaded(sessionID)
       ensureBackfill(sessionID)
@@ -638,7 +695,7 @@ export default definePlugin({
         // Slot renders run once, untracked. Effects follow its reactive Session
         // input and the message window instead of relying on claim re-renders.
         createEffect(() => {
-          applyLoads(input.sessionID, extractSkillLoadState(ctx.data.session.message.list(input.sessionID), true))
+          applyLoads(input.sessionID, liveLoadState(input.sessionID))
           ensureBackfill(input.sessionID)
         })
 
@@ -678,6 +735,9 @@ export default definePlugin({
       if (initialRefreshTimer !== undefined) clearTimeout(initialRefreshTimer)
       for (const controller of backfilling.values()) controller.abort()
       backfilling.clear()
+      backfillUsage.clear()
+      observedUsageBySession.clear()
+      compactionTimeBySession.clear()
       for (const controller of sampling.values()) controller.abort()
       sampling.clear()
 

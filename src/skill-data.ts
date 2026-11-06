@@ -215,6 +215,8 @@ export type SkillUsage = ReadonlyMap<string, readonly SkillInvocation[]>
 export interface SkillLoadState {
   loaded: Set<string>
   compactionID?: string
+  /** Timestamp of the boundary, collected only with usage. */
+  compactionTime?: number
   /** Only collected when requested; preserves the existing load-only API. */
   usage?: SkillUsage
 }
@@ -296,13 +298,14 @@ function collectMessageUsage(
 export function mergeSkillUsage(previous: SkillUsage, incoming: SkillUsage): SkillUsage {
   let next: Map<string, readonly SkillInvocation[]> | undefined
   for (const [messageID, calls] of incoming) {
-    const old = previous.get(messageID) ?? []
-    if (old.length === calls.length && old.every((call, i) =>
+    const old = previous.get(messageID)
+    if (old && old.length === calls.length && old.every((call, i) =>
       call.callID === calls[i]!.callID && call.skillID === calls[i]!.skillID && call.agentID === calls[i]!.agentID,
     )) continue
     next ??= new Map(previous)
-    if (calls.length) next.set(messageID, calls)
-    else next.delete(messageID)
+    // Keep an empty snapshot as a tombstone until the stage is reset. Otherwise
+    // a late history read can resurrect calls removed by a newer live snapshot.
+    next.set(messageID, calls)
   }
   return next ?? previous
 }
@@ -323,11 +326,38 @@ export function summarizeSkillUsage(usage?: SkillUsage): Map<string, string> {
     .join(" · ")]))
 }
 
+/** Host message timestamps are evidence; message IDs are not sortable timestamps. */
+function messageCreated(message: unknown): number | undefined {
+  const created = (message as { time?: { created?: unknown } } | null)?.time?.created
+  return typeof created === "number" && Number.isFinite(created) ? created : undefined
+}
+
+/** Restrict a partial live cache to the already verified compaction stage. */
+export function messagesAfterSkillCompaction(
+  messages: readonly unknown[],
+  boundary?: { id: string; created?: number },
+): readonly unknown[] {
+  if (!boundary) return messages
+  const index = messages.findIndex((message) => {
+    const entry = message as { id?: unknown; type?: unknown; status?: unknown } | null
+    return entry?.id === boundary.id && entry.type === "compaction" && entry.status === "completed"
+  })
+  if (index >= 0) return messages.slice(index)
+  // Without the marker, only strictly later timestamps prove stage membership.
+  // Missing/equal timestamps cannot safely restore an earlier stage's calls.
+  if (boundary.created === undefined) return []
+  return messages.filter((message) => {
+    const created = messageCreated(message)
+    return created !== undefined && created > boundary.created!
+  })
+}
+
 /** Project an ascending message window; summary/recent text never proves a new load. */
 export function extractSkillLoadState(messages: readonly unknown[], trackUsage = false): SkillLoadState {
   const loaded = new Set<string>()
   const usage = trackUsage ? new Map<string, readonly SkillInvocation[]>() : undefined
   let compactionID: string | undefined
+  let compactionTime: number | undefined
   for (const message of messages) {
     const entry = message as { id?: string; type?: unknown; status?: unknown } | null
     if (entry?.type === "compaction" && entry.status === "completed") {
@@ -335,11 +365,12 @@ export function extractSkillLoadState(messages: readonly unknown[], trackUsage =
       loaded.clear()
       usage?.clear()
       compactionID = entry.id
+      compactionTime = messageCreated(message)
     }
     for (const id of extractMessageSkillLoads(message)) loaded.add(id)
     if (usage) collectMessageUsage(usage, message)
   }
-  return { loaded, compactionID, ...(usage ? { usage } : {}) }
+  return { loaded, compactionID, ...(usage ? { usage, ...(compactionTime === undefined ? {} : { compactionTime }) } : {}) }
 }
 
 /**
@@ -368,7 +399,8 @@ export async function backfillLoadedSkills(
     if (signal?.aborted) return
     for (const message of page.data) {
       if (message.type === "compaction" && message.status === "completed") {
-        return { loaded, compactionID: message.id, ...(usage ? { usage } : {}) }
+        const compactionTime = messageCreated(message)
+        return { loaded, compactionID: message.id, ...(usage ? { usage, ...(compactionTime === undefined ? {} : { compactionTime }) } : {}) }
       }
       for (const id of extractMessageSkillLoads(message)) loaded.add(id)
       if (usage) collectMessageUsage(usage, message, true)

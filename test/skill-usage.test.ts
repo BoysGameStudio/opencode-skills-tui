@@ -2,7 +2,7 @@ import { test } from "bun:test"
 import assert from "node:assert/strict"
 import type { Context } from "@opencode/plugin/tui/context"
 import {
-  backfillLoadedSkills, extractSkillLoadState, mergeSkillUsage, summarizeSkillUsage,
+  backfillLoadedSkills, extractSkillLoadState, mergeSkillUsage, summarizeSkillUsage, messagesAfterSkillCompaction,
   type SkillUsage,
 } from "../src/skill-data"
 
@@ -165,4 +165,48 @@ test("separate session collections do not leak even with identical message/call 
   const sessions = new Map<string, SkillUsage>([["a", usage([message("m", "agent-a")])], ["b", usage([message("m", "agent-b")])]])
   assert.equal(summarizeSkillUsage(sessions.get("a")).get("ui"), "agent-a ×1")
   assert.equal(summarizeSkillUsage(sessions.get("b")).get("ui"), "agent-b ×1")
+})
+
+test("empty usage snapshots are retained so history cannot resurrect removed calls", () => {
+  const empty = usage([message("m", "build", [])])
+  const observed = mergeSkillUsage(new Map(), empty)
+  assert.equal(observed.has("m"), true)
+  const oldHistory = usage([message("m", "build")])
+  assert.equal(summarizeSkillUsage(mergeSkillUsage(oldHistory, observed)).size, 0)
+})
+
+test("a known compaction marker slices the live cache without requiring timestamps", () => {
+  const messages = [message("before", "old"), compact("boundary"), message("after", "new")]
+  assert.deepEqual(messagesAfterSkillCompaction(messages, { id: "boundary" }), messages.slice(1))
+})
+
+test("a partial cache without the known marker accepts only proven later messages", () => {
+  const old = { ...message("before", "old"), time: { created: 10 } }
+  const later = { ...message("after", "new"), time: { created: 30 } }
+  const sameTime = { ...message("ambiguous", "unknown"), time: { created: 20 } }
+  const noTime = { ...message("missing", "unknown"), time: undefined }
+  const messages = [old, sameTime, noTime, later]
+  assert.deepEqual(messagesAfterSkillCompaction(messages, { id: "boundary", created: 20 }), [later])
+  assert.deepEqual(messagesAfterSkillCompaction(messages, { id: "boundary" }), [])
+})
+
+test("a newer compaction in the live window remains discoverable", () => {
+  const messages = [
+    { ...compact("old"), time: { created: 10 } },
+    { ...compact("next"), time: { created: 30 } },
+    { ...message("after", "new"), time: { created: 40 } },
+  ]
+  const state = extractSkillLoadState(messagesAfterSkillCompaction(messages, { id: "current", created: 20 }), true)
+  assert.equal(state.compactionID, "next")
+  assert.equal(state.compactionTime, 30)
+  assert.equal(summarizeSkillUsage(state.usage).get("ui"), "new ×1")
+})
+
+test("usage readers retain boundary time without changing the load-only return shape", async () => {
+  const boundary = { ...compact("boundary"), time: { created: 20 } }
+  assert.equal(extractSkillLoadState([boundary], true).compactionTime, 20)
+  assert.deepEqual(extractSkillLoadState([boundary]), { loaded: new Set(), compactionID: "boundary" })
+  const ctx = context(async () => ({ data: [boundary], cursor: {} }))
+  assert.equal((await backfillLoadedSkills(ctx, "s", undefined, true))!.compactionTime, 20)
+  assert.deepEqual(await backfillLoadedSkills(ctx, "s"), { loaded: new Set(), compactionID: "boundary" })
 })
