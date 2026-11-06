@@ -254,6 +254,7 @@ export default definePlugin({
     const [loadedBySession, setLoadedBySession] = createSignal(new Map<string, Set<string>>())
     const [usageBySession, setUsageBySession] = createSignal(new Map<string, SkillUsage>())
     const observedUsageBySession = new Map<string, SkillUsage>()
+    const observedMessageTimeBySession = new Map<string, Map<string, number>>()
     const [fileSamples, setFileSamples] = createSignal(new Map<string, readonly string[] | undefined>())
     const sampling = new Map<string, AbortController>()
     const backfilled = new Set<string>()
@@ -331,9 +332,21 @@ export default definePlugin({
     }
 
     const liveLoadState = (sessionID: string) => {
+      if (disposed || deletedSessions.has(sessionID)) return extractSkillLoadState([], true)
       const id = compactionBySession.get(sessionID)
       const messages = messagesAfterSkillCompaction(ctx.data.session.message.list(sessionID),
         id ? { id, created: compactionTimeBySession.get(sessionID) } : undefined)
+      // Keep timestamp evidence independently of the host's sliding window.
+      // Without it a later backfill cannot place evicted calls in a new stage.
+      for (const message of messages) {
+        const entry = message as { id?: unknown; type?: unknown; time?: { created?: unknown } } | null
+        const created = entry?.time?.created
+        if (entry?.type !== "assistant" || typeof entry.id !== "string" || !entry.id ||
+          typeof created !== "number" || !Number.isFinite(created)) continue
+        let times = observedMessageTimeBySession.get(sessionID)
+        if (!times) observedMessageTimeBySession.set(sessionID, times = new Map())
+        times.set(entry.id, created)
+      }
       return extractSkillLoadState(messages, true)
     }
 
@@ -353,6 +366,8 @@ export default definePlugin({
         const valid = new Set(state.usage?.keys() ?? [])
         const observed = observedUsageBySession.get(sessionID) ?? EMPTY_SKILL_USAGE
         observedUsageBySession.set(sessionID, new Map([...observed].filter(([id]) => valid.has(id))))
+        const times = observedMessageTimeBySession.get(sessionID)
+        if (times) observedMessageTimeBySession.set(sessionID, new Map([...times].filter(([id]) => valid.has(id))))
       }
       if (state.compactionID && state.compactionTime !== undefined) compactionTimeBySession.set(sessionID, state.compactionTime)
       for (const id of state.loaded) markLoaded(sessionID, id)
@@ -403,10 +418,19 @@ export default definePlugin({
             const verifiedLive = extractSkillLoadState(messagesAfterSkillCompaction(currentMessages,
               state.compactionID ? { id: state.compactionID, created: state.compactionTime } : undefined), true)
             const valid = new Set([...(state.usage?.keys() ?? []), ...(verifiedLive.usage?.keys() ?? [])])
-            const changes = state.compactionID === stage ? overlay
-              : new Map([...overlay].filter(([id]) => valid.has(id)))
-            const usage = state.usage ? mergeSkillUsage(state.usage, changes) : undefined
-            applyLoads(sessionID, { ...state, usage }, true)
+            const times = observedMessageTimeBySession.get(sessionID)
+            const belongsToStage = (id: string) => state.compactionID === stage || valid.has(id) ||
+              (state.compactionTime !== undefined && (times?.get(id) ?? -Infinity) > state.compactionTime)
+            // Retain proven post-boundary calls even after their messages leave
+            // both the live window and this older history snapshot. History wins
+            // over pre-request cache copies; actual mid-request updates win last.
+            const retained = new Map([...(usageBySession().get(sessionID) ?? EMPTY_SKILL_USAGE)]
+              .filter(([id]) => belongsToStage(id)))
+            const changes = new Map([...overlay].filter(([id]) => belongsToStage(id)))
+            const usage = state.usage ? mergeSkillUsage(mergeSkillUsage(retained, state.usage), changes) : undefined
+            const loaded = new Set(state.loaded)
+            for (const calls of usage?.values() ?? []) for (const call of calls) loaded.add(call.skillID)
+            applyLoads(sessionID, { ...state, loaded, usage }, true)
             // Do not replay a stale cache across a newer boundary found in history.
             applyLoads(sessionID, liveLoadState(sessionID))
             // Set before batch flush, so reactive effects cannot start a second read.
@@ -534,6 +558,7 @@ export default definePlugin({
       compactionBySession.delete(sessionID)
       compactionTimeBySession.delete(sessionID)
       observedUsageBySession.delete(sessionID)
+      observedMessageTimeBySession.delete(sessionID)
     })
 
     const unregisterCompactionEnded = ctx.data.on("session.compaction.ended", (event) => {
@@ -737,6 +762,7 @@ export default definePlugin({
       backfilling.clear()
       backfillUsage.clear()
       observedUsageBySession.clear()
+      observedMessageTimeBySession.clear()
       compactionTimeBySession.clear()
       for (const controller of sampling.values()) controller.abort()
       sampling.clear()

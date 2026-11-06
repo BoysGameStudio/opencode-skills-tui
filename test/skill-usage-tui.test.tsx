@@ -304,3 +304,86 @@ test("deleting a session discards both counts and an in-flight history response"
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
   }, { history: () => pending.promise })
 })
+
+test.each([false, true])("history-discovered compaction retains evicted calls observed before the request: %s", async (beforeRequest) => {
+  const pending = Promise.withResolvers<any>()
+  const after = message("evicted", "build", 2, 30)
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes(beforeRequest ? "build ×2" : "old-agent ×1"))
+    if (!beforeRequest) {
+      host.setMessages("s1", [after])
+      await view.waitForFrame((frame) => frame.includes("build ×2"))
+    }
+    host.setMessages("s1", [message("current", "argus", 1, 40)])
+    await view.waitForFrame((frame) => frame.includes("argus ×1"))
+    // The snapshot predates both post-compaction calls, and neither the old
+    // marker nor the evicted build message remains in the current live window.
+    pending.resolve({ data: [{ id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.match(view.captureCharFrame(), /build ×2 · argus ×1/)
+    assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
+    assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
+  }, { initialMessages: { s1: [beforeRequest ? after : message("before", "old-agent", 1, 5)] }, history: () => pending.promise })
+})
+
+test("retaining evicted calls does not revive pre-boundary or unproven timestamps", async () => {
+  const pending = Promise.withResolvers<any>()
+  const stale = [5, 20, Number.NaN, Infinity].map((created, i) => message(`stale-${i}`, "stale-agent", 1, created))
+  stale.push({ ...message("missing-time", "stale-agent"), time: {} as any })
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("stale-agent ×5"))
+    host.setMessages("s1", [message("current", "argus", 1, 40)])
+    await view.waitForFrame((frame) => frame.includes("argus ×1"))
+    pending.resolve({ data: [{ id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.match(view.captureCharFrame(), /argus ×1/)
+    assert.doesNotMatch(view.captureCharFrame(), /stale-agent/)
+  }, { initialMessages: { s1: stale }, history: () => pending.promise })
+})
+
+test("evicted empty replacements still override history when it first reveals a boundary", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("build ×2"))
+    host.setMessages("s1", [message("evicted", "build", 0, 30)])
+    await view.waitForFrame((frame) => !frame.includes("build ×"))
+    host.setMessages("s1", [message("current", "argus", 1, 40)])
+    await view.waitForFrame((frame) => frame.includes("argus ×1"))
+    pending.resolve({ data: [message("evicted", "build", 2, 30),
+      { id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.match(view.captureCharFrame(), /argus ×1/)
+    assert.doesNotMatch(view.captureCharFrame(), /build ×/)
+  }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
+})
+
+test("newer history wins over an evicted pre-request cache snapshot without double counting", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("build ×2"))
+    host.setMessages("s1", [message("current", "argus", 1, 40)])
+    await view.waitForFrame((frame) => frame.includes("argus ×1"))
+    pending.resolve({ data: [message("evicted", "build", 3, 30),
+      { id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.match(view.captureCharFrame(), /build ×3 · argus ×1/)
+  }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
+})
+
+test("retained post-boundary invocations restore their loaded mark even with an empty current window", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("build ×2"))
+    host.setMessages("s1", [])
+    await view.flush()
+    pending.resolve({ data: [{ id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
+    await Bun.sleep(0)
+    await view.flush()
+    assert.match(view.captureCharFrame(), /build ×2/)
+    assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
+  }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
+})
