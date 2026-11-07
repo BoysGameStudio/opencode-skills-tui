@@ -2215,16 +2215,21 @@ test.each([0, 1, 2] as const)("preview normalizes CRLF and stays read-only even 
     await withPanel(context, async (view) => {
       await view.waitForFrame((frame) => frame.includes("Review"))
       await view.mockMouse.click(4, 1, button)
-      const dialogView = await testRender(() => dialogRender(), { width: 70, height: 16 })
+      const dialogView = await testRender(() => dialogRender(), { width: 70, height: 24 })
       try {
         await waitForMarkdown(dialogView)
-        await dialogView.waitForFrame((frame) => frame.includes("Disk body"))
         const frame = dialogView.captureCharFrame()
         expect(frame.split("\n")[0].trim()).toBe("id: review")
         const rows = frame.split("\n").map((line) => line.trim())
         const pathRow = rows.findIndex((line) => line.startsWith("path:"))
         expect(rows.slice(1, pathRow).join(" ").replace(/\s/g, "")).toBe(previewStatsLabel(56, skill).replace(/\s/g, ""))
         expect(frame).toContain("description: Disk description")
+        // Windows paths wrap metadata onto extra lines; the short viewport must still scroll to the body.
+        dialogView.resize(70, 16)
+        await dialogView.flush()
+        await dialogView.mockMouse.scroll(30, 9, "down", 10)
+        await dialogView.waitForFrame((frame) => frame.includes("Disk body"))
+        expect(dialogView.captureCharFrame()).not.toContain("Registered body")
         expect(frame).not.toContain("Registered body")
         expect(frame).not.toContain("\r")
         expect(readFileSync(path, "utf8")).toBe(raw)

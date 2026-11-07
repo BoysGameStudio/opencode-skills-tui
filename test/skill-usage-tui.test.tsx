@@ -1,9 +1,10 @@
 /** @jsxImportSource @opentui/solid */
 import { test } from "bun:test"
 import assert from "node:assert/strict"
-import { Show, createComponent, createSignal } from "solid-js"
+import { Show, batch, createComponent, createSignal } from "solid-js"
 import { createStore, produce } from "solid-js/store"
-import { RGBA } from "@opentui/core"
+import { CodeRenderable, RGBA } from "@opentui/core"
+import type { Renderable } from "@opentui/core"
 import { testRender, useRenderer } from "@opentui/solid"
 import type { Plugin } from "@opencode/plugin/tui"
 
@@ -105,11 +106,20 @@ async function withUsage(
   const host = {
     context, events, layers, settings, mutateSettings, select, setThemeMode,
     setMessages: (id: string, value: any[]) => setMessages((old) => ({ ...old, [id]: value })),
+    commitRevert: (sessionID: string, to: string) => batch(() => {
+      // Match the host projection: committed reverts remove messages at and after `to`.
+      setMessages((old) => ({ ...old, [sessionID]: (old[sessionID] ?? []).filter((item) => item.id < to) }))
+      events.get("session.revert.committed")?.({ data: { sessionID, to } })
+    }),
     openSettings: () => layers.flatMap((layer) => layer.commands).find((command) => command.id === "opencode-skills-tui.sider").run(),
     close: () => context.ui.dialog.clear(),
     dialog,
   }
-  try { await check(view, host) } finally { cleanup(); view.renderer.destroy() }
+  try { await check(view, host) } finally {
+    cleanup()
+    view.renderer.destroy()
+    assert.equal(events.size, 0)
+  }
 }
 
 function node(view: Awaited<ReturnType<typeof testRender>>, id: string) {
@@ -134,6 +144,15 @@ test("sidebar adds only the usage line; it is not a new click target", async () 
     assert.equal(host.dialog(), undefined)
     await click(view, "skills-panel.ui")
     await view.waitForFrame((frame) => frame.includes("agents: unity-engineer ×3 · argus ×2"))
+    await view.renderOnce()
+    const pending: Promise<void>[] = []
+    const visit = (node: Renderable) => {
+      if (node instanceof CodeRenderable) pending.push(node.highlightingDone)
+      for (const child of node.getChildren()) visit(child)
+    }
+    visit(view.renderer.root)
+    await Promise.all(pending)
+    await view.flush()
     assert.match(view.captureCharFrame(), /Keep the existing interface/)
     assert.deepEqual(host.layers.flatMap((layer: any) => layer.commands).filter((command: any) => command.slash).map((command: any) => command.slash.name), ["skills-sidebar"])
   })
@@ -199,7 +218,7 @@ test("session switching does not aggregate other sessions or reassign historical
 
 test("narrow rows truncate usage independently and keep the original token column", async () => {
   await withUsage(async (view, host) => {
-    await view.waitForFrame((frame) => frame.includes("unity-engineer"))
+    await view.waitForFrame((frame) => frame.includes("argus ×2"))
     const row = node(view, "skills-panel.ui")
     const usage = node(view, "skills-panel.ui.agents")
     const tokens = node(view, "skills-panel.ui.tokens")
@@ -386,4 +405,55 @@ test("retained post-boundary invocations restore their loaded mark even with an 
     assert.match(view.captureCharFrame(), /build ×2/)
     assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
   }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
+})
+
+test("committed reverts remove calls and load marks and rebuild retained history", async () => {
+  let requests = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×3 · argus ×2"))
+    host.commitRevert("s1", "m1")
+    await view.waitForFrame((frame) => frame.includes("older-agent ×1"))
+    assert.doesNotMatch(view.captureCharFrame(), /unity-engineer|argus/)
+    assert.equal(requests, 2)
+    host.commitRevert("s1", "m0")
+    await view.waitForFrame((frame) => frame.includes("0 loaded") && !frame.includes("older-agent"))
+    assert.equal(requests, 3)
+  }, { history: async () => ({ data: ++requests === 2 ? [message("m0", "older-agent")] : [], cursor: {} }) })
+})
+
+test("a committed revert across compaction restores the earlier stage", async () => {
+  let requests = 0
+  const before = message("m1", "before-agent", 2, 10)
+  const boundary = { id: "m2", type: "compaction", status: "completed", time: { created: 20 } }
+  const after = message("m3", "after-agent", 1, 30)
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("after-agent ×1"))
+    host.commitRevert("s1", "m2")
+    await view.waitForFrame((frame) => frame.includes("before-agent ×2"))
+    assert.doesNotMatch(view.captureCharFrame(), /after-agent/)
+    assert.match(view.captureCharFrame(), /1 loaded/)
+    assert.equal(requests, 2)
+  }, {
+    initialMessages: { s1: [before, boundary, after] },
+    history: async () => ({ data: ++requests === 1 ? [after, boundary] : [before], cursor: {} }),
+  })
+})
+
+test("a committed revert invalidates in-flight history without affecting another session", async () => {
+  const pending = Promise.withResolvers<any>()
+  let requests = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("unity-engineer ×3"))
+    host.select("s2")
+    await view.waitForFrame((frame) => frame.includes("other-agent ×1"))
+    host.commitRevert("s1", "m1")
+    await view.flush()
+    assert.match(view.captureCharFrame(), /other-agent ×1/)
+    pending.resolve({ data: [message("m1", "stale-agent", 9)], cursor: {} })
+    await Bun.sleep(0)
+    host.select("s1")
+    await view.waitForFrame((frame) => frame.includes("0 loaded"))
+    assert.doesNotMatch(view.captureCharFrame(), /stale-agent|unity-engineer|argus|other-agent/)
+    assert.equal(requests, 3)
+  }, { history: async () => ++requests === 1 ? pending.promise : { data: [], cursor: {} } })
 })

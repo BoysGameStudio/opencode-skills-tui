@@ -561,6 +561,22 @@ export default definePlugin({
       observedMessageTimeBySession.delete(sessionID)
     })
 
+    const unregisterRevertCommitted = ctx.data.on("session.revert.committed", (event) => {
+      const sessionID = event.data.sessionID
+      if (disposed || deletedSessions.has(sessionID)) return
+      // The host has removed reverted messages. A missing window entry alone
+      // cannot distinguish removal from eviction, so rebuild on this explicit event.
+      batch(() => {
+        resetLoaded(sessionID)
+        compactionBySession.delete(sessionID)
+        compactionTimeBySession.delete(sessionID)
+        observedUsageBySession.delete(sessionID)
+        observedMessageTimeBySession.delete(sessionID)
+        applyLoads(sessionID, liveLoadState(sessionID))
+        ensureBackfill(sessionID)
+      })
+    })
+
     const unregisterCompactionEnded = ctx.data.on("session.compaction.ended", (event) => {
       const sessionID = event.data.sessionID
       if (disposed || deletedSessions.has(sessionID)) return
@@ -772,6 +788,7 @@ export default definePlugin({
       unregisterProjectUpdated()
       unregisterSkillActivated()
       unregisterSessionDeleted()
+      unregisterRevertCommitted()
       unregisterCompactionEnded()
     }
   },
