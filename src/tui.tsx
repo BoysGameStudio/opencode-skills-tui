@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs"
 import type { Plugin } from "@opencode/plugin/tui"
 import { CliRenderEvents, CodeRenderable, InputRenderable, SyntaxStyle, TextAttributes, isRenderable } from "@opentui/core"
 import type { MouseEvent, Renderable } from "@opentui/core"
-import { Show, batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+import { Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import type { Accessor } from "solid-js"
 import type { LocationRef } from "@opencode/client"
 import { useTerminalDimensions, useRenderer } from "@opentui/solid"
@@ -20,18 +20,12 @@ import {
   formatTokenCount,
   loadAvailableSkills,
   loadSkillFileSamples,
-  mergeSkillUsage,
-  messagesAfterSkillCompaction,
-  summarizeSkillUsage,
   toSummaries,
   type SkillDisplayMode,
   type SkillSummary,
-  type SkillUsage,
-  type SkillInvocation,
 } from "./skill-data"
 
 const EMPTY_LOADED_SKILLS = new Set<string>()
-const EMPTY_SKILL_USAGE: SkillUsage = new Map()
 
 // shortcut: runtime imports of @opencode/plugin/tui or @opencode/client/solid load
 // @opencode/schema against the host binary's embedded effect, which broke on the
@@ -83,7 +77,6 @@ function SkillPreviewDialog(props: {
   ctx: Plugin.Context
   skill: SkillSummary
   raw?: string
-  agentUsage: Accessor<string | undefined>
   theme: Accessor<ResolvedTheme>
   renderer: {
     getLinkAt: (x: number, y: number) => string | null
@@ -192,9 +185,6 @@ function SkillPreviewDialog(props: {
         <text width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>
           {`path: ${source}`}
         </text>
-        <text id="skills-preview.agents" width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>
-          {`agents: ${props.agentUsage() || "-"}`}
-        </text>
         <box id="skills-preview.separator" width="100%" flexShrink={0} marginBottom={1}
           onSizeChange={function () { setSeparatorWidth(this.width) }}>
           <text content={separator()} width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC} />
@@ -219,7 +209,7 @@ export default definePlugin({
   setup(ctx) {
     // Keep collapse per-terminal. Old in-memory settings seed the durable store on reload.
     const [ui, mutateUI] = ctx.storage.memory<Omit<SkillsSiderSettings, "token"> & { token: SkillsSiderSettings["token"] | "metadata" | "instructions"; collapsed: boolean; displayMode?: SkillDisplayMode }>("prefs", {
-      initial: { collapsed: false, switch: "on", scope: "model", preview: "left-click", mention: "right-click", token: "off", state: "on", usage: "on" },
+      initial: { collapsed: false, switch: "on", scope: "model", preview: "left-click", mention: "right-click", token: "off", state: "on" },
     })
     const normalizeSettings = (value: Omit<typeof ui, "collapsed">): SkillsSiderSettings => ({
       switch: value.switch ?? "on",
@@ -228,7 +218,6 @@ export default definePlugin({
       mention: value.mention ?? "right-click",
       token: value.token === "metadata" ? "listing" : value.token === "instructions" ? "load-delta" : value.token ?? "off",
       state: value.state ?? "on",
-      usage: value.usage ?? "on",
     })
     const [prefs, mutatePrefs] = ctx.storage.store<Omit<typeof ui, "collapsed">>("settings", {
       initial: normalizeSettings(ui),
@@ -252,87 +241,19 @@ export default definePlugin({
     }
 
     const [loadedBySession, setLoadedBySession] = createSignal(new Map<string, Set<string>>())
-    const [usageBySession, setUsageBySession] = createSignal(new Map<string, SkillUsage>())
-    const observedUsageBySession = new Map<string, SkillUsage>()
-    const observedMessageTimeBySession = new Map<string, Map<string, number>>()
     const [fileSamples, setFileSamples] = createSignal(new Map<string, readonly string[] | undefined>())
     const sampling = new Map<string, AbortController>()
     const backfilled = new Set<string>()
     const backfilling = new Map<string, AbortController>()
-    const backfillUsage = new Map<string, Map<string, readonly SkillInvocation[]>>()
     const [refreshByLocation, setRefreshByLocation] = createSignal(
       new Map<string, { id: number; failure?: { skills: unknown; agents: unknown } }>(),
     )
     const compactionBySession = new Map<string, string>()
-    const compactionTimeBySession = new Map<string, number>()
     const deletedSessions = new Set<string>()
-    const [parents, setParents] = createSignal(new Map<string, string>())
-    const discovering = new Map<string, AbortController>()
-    const discovered = new Set<string>()
-    const watched = new Map<string, number>()
-    const dirtyHistory = new Set<string>()
     let disposed = false
     let refreshID = 0
     let initialRefreshTimer: ReturnType<typeof setTimeout> | undefined
     let stopNativeSelection: (() => void) | undefined
-
-    const rememberParents = (sessions: readonly { id: string; parentID?: string }[]) => {
-      setParents((current) => {
-        const next = new Map(current)
-        for (const session of sessions) {
-          if (session.parentID && !deletedSessions.has(session.id)) next.set(session.id, session.parentID)
-        }
-        return next.size === current.size && [...next].every(([id, parent]) => current.get(id) === parent) ? current : next
-      })
-    }
-    const descendants = (root: string) => {
-      const result = new Set<string>()
-      const visit = (id: string) => {
-        if (result.has(id) || deletedSessions.has(id)) return
-        result.add(id)
-        for (const [child, parent] of parents()) if (parent === id) visit(child)
-      }
-      visit(root)
-      return result
-    }
-    // family() includes ancestors/siblings and only cached sessions. Query the
-    // native parentID index, one bounded page at a time, for each reachable node.
-    const discoverChildren = (sessionID: string) => {
-      if (disposed || deletedSessions.has(sessionID) || discovered.has(sessionID) || discovering.has(sessionID)) return
-      const controller = new AbortController()
-      discovering.set(sessionID, controller)
-      void (async () => {
-        let cursor: string | undefined
-        const cursors = new Set<string>()
-        do {
-          const page = await ctx.client.session.list({ parentID: sessionID, limit: 200, ...(cursor ? { cursor } : { order: "desc" as const }) })
-          if (disposed || controller.signal.aborted || discovering.get(sessionID) !== controller) return
-          rememberParents(page.data.filter((child) => child.parentID === sessionID))
-          cursor = page.cursor?.next ?? undefined
-          if (cursor && cursors.has(cursor)) throw new Error("Repeated session cursor")
-          if (cursor) cursors.add(cursor)
-        } while (cursor)
-        discovered.add(sessionID)
-      })().catch(() => {
-        // Keep known descendants; a later view/activity can retry discovery.
-      }).finally(() => {
-        if (discovering.get(sessionID) === controller) discovering.delete(sessionID)
-      })
-    }
-    const familyUsage = (sessionID: string) => {
-      const usage = new Map<string, readonly SkillInvocation[]>()
-      for (const id of descendants(sessionID)) {
-        for (const [message, calls] of usageBySession().get(id) ?? []) usage.set(JSON.stringify([id, message]), calls)
-      }
-      return summarizeSkillUsage(usage)
-    }
-    const childLoads = (sessionID: string) => {
-      const loaded = new Set<string>()
-      for (const id of descendants(sessionID)) {
-        if (id !== sessionID) for (const skill of loadedBySession().get(id) ?? []) loaded.add(skill)
-      }
-      return loaded
-    }
 
     const sampleKey = (skill: SkillSummary, location: LocationRef) => `${locationKey(location)}\0${skill.path}`
     const clearFileSamples = (location: LocationRef) => {
@@ -378,14 +299,7 @@ export default definePlugin({
     const resetLoaded = (sessionID: string) => {
       backfilling.get(sessionID)?.abort()
       backfilling.delete(sessionID)
-      backfillUsage.delete(sessionID)
       backfilled.delete(sessionID)
-      setUsageBySession((current) => {
-        if (!current.has(sessionID)) return current
-        const next = new Map(current)
-        next.delete(sessionID)
-        return next
-      })
       setLoadedBySession((current) => {
         if (!current.has(sessionID)) return current
         const next = new Map(current)
@@ -394,67 +308,13 @@ export default definePlugin({
       })
     }
 
-    const liveLoadState = (sessionID: string) => {
-      if (disposed || deletedSessions.has(sessionID)) return extractSkillLoadState([], true)
-      const id = compactionBySession.get(sessionID)
-      const messages = messagesAfterSkillCompaction(ctx.data.session.message.list(sessionID),
-        id ? { id, created: compactionTimeBySession.get(sessionID) } : undefined)
-      // Keep timestamp evidence independently of the host's sliding window.
-      // Without it a later backfill cannot place evicted calls in a new stage.
-      for (const message of messages) {
-        const entry = message as { id?: unknown; type?: unknown; time?: { created?: unknown } } | null
-        const created = entry?.time?.created
-        if (entry?.type !== "assistant" || typeof entry.id !== "string" || !entry.id ||
-          typeof created !== "number" || !Number.isFinite(created)) continue
-        let times = observedMessageTimeBySession.get(sessionID)
-        if (!times) observedMessageTimeBySession.set(sessionID, times = new Map())
-        times.set(entry.id, created)
-      }
-      return extractSkillLoadState(messages, true)
-    }
-
-    const applyLoads = (sessionID: string, state: ReturnType<typeof extractSkillLoadState>, fromHistory = false) => {
+    const applyLoads = (sessionID: string, state: ReturnType<typeof extractSkillLoadState>) => {
       if (disposed || deletedSessions.has(sessionID)) return
-      let resetStage = false
       if (state.compactionID && state.compactionID !== compactionBySession.get(sessionID)) {
-        const currentTime = compactionTimeBySession.get(sessionID)
-        if (currentTime !== undefined && state.compactionTime !== undefined && state.compactionTime < currentTime) return
         compactionBySession.set(sessionID, state.compactionID)
-        compactionTimeBySession.delete(sessionID)
-        if (state.compactionTime !== undefined) compactionTimeBySession.set(sessionID, state.compactionTime)
         resetLoaded(sessionID)
-        resetStage = true
-        // Keep already observed snapshots only when they belong to the new stage.
-        // Forgetting them would make an unchanged stale cache look like an update.
-        const valid = new Set(state.usage?.keys() ?? [])
-        const observed = observedUsageBySession.get(sessionID) ?? EMPTY_SKILL_USAGE
-        observedUsageBySession.set(sessionID, new Map([...observed].filter(([id]) => valid.has(id))))
-        const times = observedMessageTimeBySession.get(sessionID)
-        if (times) observedMessageTimeBySession.set(sessionID, new Map([...times].filter(([id]) => valid.has(id))))
       }
-      if (state.compactionID && state.compactionTime !== undefined) compactionTimeBySession.set(sessionID, state.compactionTime)
       for (const id of state.loaded) markLoaded(sessionID, id)
-      if (state.usage) {
-        let incoming = state.usage
-        if (!fromHistory) {
-          const previous = observedUsageBySession.get(sessionID) ?? EMPTY_SKILL_USAGE
-          const observed = mergeSkillUsage(previous, incoming)
-          // A repeated cache snapshot is not newer evidence than a history read.
-          if (!resetStage) incoming = new Map([...incoming].filter(([id]) => observed.get(id) !== previous.get(id)))
-          observedUsageBySession.set(sessionID, observed)
-          // Retain actual changes during this read even if their messages later
-          // leave the live window. Empty arrays are deliberate replacements.
-          const overlay = backfillUsage.get(sessionID)
-          if (overlay) for (const [id, calls] of incoming) overlay.set(id, calls)
-        }
-        setUsageBySession((current) => {
-          const previous = current.get(sessionID) ?? EMPTY_SKILL_USAGE
-          // Replace snapshots by identity. Absence from a page/window alone is
-          // not evidence that a previously observed live message was deleted.
-          const next = mergeSkillUsage(previous, incoming)
-          return next === previous ? current : new Map(current).set(sessionID, next)
-        })
-      }
     }
 
     const ensureBackfill = (sessionID: string) => {
@@ -464,54 +324,21 @@ export default definePlugin({
       ) return
 
       const controller = new AbortController()
-      const overlay = new Map<string, readonly SkillInvocation[]>()
-      const stage = compactionBySession.get(sessionID)
       backfilling.set(sessionID, controller)
-      backfillUsage.set(sessionID, overlay)
-      void backfillLoadedSkills(ctx, sessionID, controller.signal, true)
+      void backfillLoadedSkills(ctx, sessionID, controller.signal)
         .then((state) => {
-          if (disposed || controller.signal.aborted || !state || backfilling.get(sessionID) !== controller) return
+          if (disposed || controller.signal.aborted || !state) return
           // Detach this read before a newly discovered boundary invalidates older reads.
           backfilling.delete(sessionID)
-          backfillUsage.delete(sessionID)
-          batch(() => {
-            // Only post-request live changes in the same stage override history.
-            // This also preserves replacements no longer in the live window.
-            const currentMessages = ctx.data.session.message.list(sessionID)
-            const verifiedLive = extractSkillLoadState(messagesAfterSkillCompaction(currentMessages,
-              state.compactionID ? { id: state.compactionID, created: state.compactionTime } : undefined), true)
-            const valid = new Set([...(state.usage?.keys() ?? []), ...(verifiedLive.usage?.keys() ?? [])])
-            const times = observedMessageTimeBySession.get(sessionID)
-            const belongsToStage = (id: string) => state.compactionID === stage || valid.has(id) ||
-              (state.compactionTime !== undefined && (times?.get(id) ?? -Infinity) > state.compactionTime)
-            // Retain proven post-boundary calls even after their messages leave
-            // both the live window and this older history snapshot. History wins
-            // over pre-request cache copies; actual mid-request updates win last.
-            const retained = new Map([...(usageBySession().get(sessionID) ?? EMPTY_SKILL_USAGE)]
-              .filter(([id]) => belongsToStage(id)))
-            const changes = new Map([...overlay].filter(([id]) => belongsToStage(id)))
-            const usage = state.usage ? mergeSkillUsage(mergeSkillUsage(retained, state.usage), changes) : undefined
-            const loaded = new Set(state.loaded)
-            for (const calls of usage?.values() ?? []) for (const call of calls) loaded.add(call.skillID)
-            applyLoads(sessionID, { ...state, loaded, usage }, true)
-            // Do not replay a stale cache across a newer boundary found in history.
-            applyLoads(sessionID, liveLoadState(sessionID))
-            // Set before batch flush, so reactive effects cannot start a second read.
-            backfilled.add(sessionID)
-          })
+          applyLoads(sessionID, state)
+          applyLoads(sessionID, extractSkillLoadState(ctx.data.session.message.list(sessionID)))
+          backfilled.add(sessionID)
         })
         .catch(() => {
           // History unreachable: live message scans still mark loads.
         })
         .finally(() => {
-          if (backfilling.get(sessionID) === controller) {
-            backfilling.delete(sessionID)
-            backfillUsage.delete(sessionID)
-          }
-          if (!disposed && dirtyHistory.delete(sessionID)) {
-            backfilled.delete(sessionID)
-            ensureBackfill(sessionID)
-          }
+          if (backfilling.get(sessionID) === controller) backfilling.delete(sessionID)
         })
     }
 
@@ -521,7 +348,7 @@ export default definePlugin({
       })
     }
 
-    const renderSkillPreview = (skill: SkillSummary, location: LocationRef, sessionID: string) => {
+    const renderSkillPreview = (skill: SkillSummary, location: LocationRef) => {
       // Read the SKILL.md from disk and render it verbatim; normalize CRLF so
       // Windows line endings can't leak into the rendered lines. Unreadable
       // files fall back to the stripped server content.
@@ -534,14 +361,10 @@ export default definePlugin({
         }
       }
       const previewSkill = createMemo(() => ({ ...skill, fileSamples: fileSamples().get(sampleKey(skill, location)) }))
-      const agentUsage = createMemo(() => {
-        const usage = familyUsage(sessionID).get(skill.id)
-        return childLoads(sessionID).has(skill.id) ? `${usage ? `${usage} · ` : ""}subagent` : usage
-      })
-      return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} agentUsage={agentUsage} theme={() => ctx.theme} renderer={ctx.renderer} />
+      return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} theme={() => ctx.theme} renderer={ctx.renderer} />
     }
 
-    const openSkillPreview = (skill: SkillSummary, location: LocationRef, sessionID: string) => {
+    const openSkillPreview = (skill: SkillSummary, location: LocationRef) => {
       ensureFileSamples(skill, location, true)
       // The host backdrop swallows the first dismiss click while a selection
       // exists (mousedown sets dismiss=!!getSelection()), so a zero-width
@@ -549,7 +372,7 @@ export default definePlugin({
       // click outside twice. Clear it before the dialog mounts.
       ctx.renderer.clearSelection()
       // dialog.set() targets the active dialog, so show it first.
-      ctx.ui.dialog.show(() => renderSkillPreview(skill, location, sessionID))
+      ctx.ui.dialog.show(() => renderSkillPreview(skill, location))
       ctx.ui.dialog.set({ size: "xlarge", centered: true })
     }
 
@@ -624,69 +447,15 @@ export default definePlugin({
     const unregisterSessionDeleted = ctx.data.on("session.deleted", (event) => {
       const sessionID = event.data.sessionID
       deletedSessions.add(sessionID)
-      // Tombstones alone are nonreactive. Publish topology even when this
-      // empty session has no load/usage entry to remove (it may bridge workers).
-      setParents((current) => {
-        const next = new Map(current)
-        next.delete(sessionID)
-        return next
-      })
-      discovering.get(sessionID)?.abort()
-      discovering.delete(sessionID)
-      dirtyHistory.delete(sessionID)
       resetLoaded(sessionID)
       compactionBySession.delete(sessionID)
-      compactionTimeBySession.delete(sessionID)
-      observedUsageBySession.delete(sessionID)
-      observedMessageTimeBySession.delete(sessionID)
-    })
-
-    const unregisterCreated = ctx.data.on("session.created", (event) => {
-      rememberParents([{ id: event.data.sessionID, parentID: event.data.parentID }])
-    })
-    const unregisterActivity = ctx.data.listen(({ details }) => {
-      if (!["session.tool.success", "session.tool.failed", "session.skill.activated", "session.idle", "session.execution.started"].includes(details.type)) return
-      const sessionID = (details.data as { sessionID?: string }).sessionID
-      if (!sessionID || !watched.has(sessionID) || disposed || deletedSessions.has(sessionID)) return
-      if (details.type === "session.tool.success" || details.type === "session.tool.failed") {
-        const message = ctx.data.session.message.list(sessionID).find((message) => message.id === details.data.assistantMessageID)
-        const tool = message?.type === "assistant" ? message.content.find((part) => part.type === "tool" && part.id === details.data.id) : undefined
-        // The success/failure event has no tool name. Skip only proven non-skill
-        // calls; an uncached background call still needs a durable read.
-        if (tool?.type === "tool" && tool.name !== "skill") return
-      }
-      // Inactive/background sessions need durable reads too. Coalesce activity
-      // during an in-flight read into one follow-up, rather than losing resumes.
-      backfilled.delete(sessionID)
-      if (backfilling.has(sessionID)) dirtyHistory.add(sessionID)
-      else ensureBackfill(sessionID)
-      if (details.type === "session.idle" || details.type === "session.execution.started") {
-        discovered.delete(sessionID)
-        discoverChildren(sessionID)
-      }
-    })
-
-    const unregisterRevertCommitted = ctx.data.on("session.revert.committed", (event) => {
-      const sessionID = event.data.sessionID
-      if (disposed || deletedSessions.has(sessionID)) return
-      // The host has removed reverted messages. A missing window entry alone
-      // cannot distinguish removal from eviction, so rebuild on this explicit event.
-      batch(() => {
-        resetLoaded(sessionID)
-        compactionBySession.delete(sessionID)
-        compactionTimeBySession.delete(sessionID)
-        observedUsageBySession.delete(sessionID)
-        observedMessageTimeBySession.delete(sessionID)
-        applyLoads(sessionID, liveLoadState(sessionID))
-        ensureBackfill(sessionID)
-      })
     })
 
     const unregisterCompactionEnded = ctx.data.on("session.compaction.ended", (event) => {
       const sessionID = event.data.sessionID
       if (disposed || deletedSessions.has(sessionID)) return
       // The host projects ended events into completed messages, even for inactive sessions.
-      const state = liveLoadState(sessionID)
+      const state = extractSkillLoadState(ctx.data.session.message.list(sessionID))
       if (state.compactionID) applyLoads(sessionID, state)
       else resetLoaded(sessionID)
       ensureBackfill(sessionID)
@@ -714,7 +483,7 @@ export default definePlugin({
       }
       const permissions = [...(agent?.permissions ?? []), ...(current?.permissions ?? [])]
       return {
-        skills: toSummaries(registered, permissions, new Set([...loaded, ...(sessionID ? childLoads(sessionID) : [])]), mode).map((skill) => {
+        skills: toSummaries(registered, permissions, loaded, mode).map((skill) => {
           const files = fileSamples().get(sampleKey(skill, location))
           return files === undefined ? skill : { ...skill, fileSamples: files }
         }),
@@ -829,8 +598,6 @@ export default definePlugin({
           // Read directory/workspace fields so moving the same Session also syncs.
           void refreshSkills({ directory: location.directory, workspaceID: location.workspaceID })
         })
-        const agentUsage = createMemo(() => familyUsage(input.sessionID))
-        const subagentLoaded = createMemo(() => childLoads(input.sessionID))
         const panel = createMemo(() => skillsView(input.sessionID, settings().scope, loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS))
         createEffect(() => {
           const location = session()?.location
@@ -842,30 +609,8 @@ export default definePlugin({
         // Slot renders run once, untracked. Effects follow its reactive Session
         // input and the message window instead of relying on claim re-renders.
         createEffect(() => {
-          const root = input.sessionID
-          untrack(() => {
-            for (const id of descendants(root)) {
-              discovered.delete(id)
-              backfilled.delete(id)
-            }
-          })
-        })
-        createEffect(() => rememberParents(ctx.data.session.list()))
-        createEffect(() => {
-          const ids = descendants(input.sessionID)
-          for (const id of ids) {
-            watched.set(id, (watched.get(id) ?? 0) + 1)
-            discoverChildren(id)
-            applyLoads(id, liveLoadState(id))
-            ensureBackfill(id)
-          }
-          onCleanup(() => {
-            for (const id of ids) {
-              const count = (watched.get(id) ?? 1) - 1
-              if (count) watched.set(id, count)
-              else watched.delete(id)
-            }
-          })
+          applyLoads(input.sessionID, extractSkillLoadState(ctx.data.session.message.list(input.sessionID)))
+          ensureBackfill(input.sessionID)
         })
 
         return (
@@ -876,9 +621,6 @@ export default definePlugin({
             scope={() => settings().scope}
             showState={() => settings().state === "on"}
             tokenMode={() => settings().token}
-            showAgentUsage={() => settings().usage === "on"}
-            agentUsage={agentUsage}
-            subagentLoadedIDs={subagentLoaded}
             emptyMessage={() => panel().emptyMessage}
             loadedIDs={() => loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS}
             theme={() => ctx.theme}
@@ -891,7 +633,7 @@ export default definePlugin({
                 const location = session()?.location
                 if (location) insertSkill(skill, location)
               } else if (settings().preview === click) {
-                openSkillPreview(skill, session()?.location ?? ctx.location ?? ctx.data.location.default(), input.sessionID)
+                openSkillPreview(skill, session()?.location ?? ctx.location ?? ctx.data.location.default())
               }
             }}
           /></Show>
@@ -904,14 +646,7 @@ export default definePlugin({
       stopNativeSelection?.()
       if (initialRefreshTimer !== undefined) clearTimeout(initialRefreshTimer)
       for (const controller of backfilling.values()) controller.abort()
-      for (const controller of discovering.values()) controller.abort()
-      discovering.clear()
-      dirtyHistory.clear()
       backfilling.clear()
-      backfillUsage.clear()
-      observedUsageBySession.clear()
-      observedMessageTimeBySession.clear()
-      compactionTimeBySession.clear()
       for (const controller of sampling.values()) controller.abort()
       sampling.clear()
 
@@ -920,10 +655,7 @@ export default definePlugin({
       unregisterProjectUpdated()
       unregisterSkillActivated()
       unregisterSessionDeleted()
-      unregisterRevertCommitted()
       unregisterCompactionEnded()
-      unregisterCreated()
-      unregisterActivity()
     }
   },
 })

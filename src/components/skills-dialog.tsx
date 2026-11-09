@@ -16,7 +16,6 @@ export type SkillsSiderSettings = {
   mention: SkillClickAction
   token: SkillTokenMode
   state: "on" | "off"
-  usage: "on" | "off"
 }
 
 const OPTIONS: { key: keyof SkillsSiderSettings; label?: string; category: string; values: string[]; labels?: string[] }[] = [
@@ -24,7 +23,6 @@ const OPTIONS: { key: keyof SkillsSiderSettings; label?: string; category: strin
   { key: "scope", label: "Display scope", category: "Sidebar Display", values: ["model", "registered", "loaded"], labels: ["model-visible", "registered", "loaded-only"] },
   { key: "token", label: "Token estimation", category: "Sidebar Display", values: ["listing", "load-delta", "loaded-total", "off"], labels: ["list entry", "load cost", "total cost", "off"] },
   { key: "state", label: "Header counts", category: "Sidebar Display", values: ["on", "off"] },
-  { key: "usage", label: "Agent usage", category: "Sidebar Display", values: ["on", "off"] },
   { key: "preview", label: "Skill overview", category: "Mouse actions", values: ["left-click", "middle-click", "right-click", "off"] },
   { key: "mention", label: "Insert @mention", category: "Mouse actions", values: ["left-click", "middle-click", "right-click", "off"] },
 ]
