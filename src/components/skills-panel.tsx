@@ -94,10 +94,8 @@ export function SkillsPanel(props: SkillsPanelProps) {
         >
           <For each={displayedSkills()}>
             {(skill) => {
-              const usage = () => {
-                const agents = props.agentUsage?.().get(skill.id)
-                return props.subagentLoadedIDs?.().has(skill.id) ? `${agents ? `${agents} · ` : ""}subagent` : agents
-              }
+              const usage = () => props.agentUsage?.().get(skill.id)
+              const usageEntries = createMemo(() => usage()?.split(" · ") ?? [])
               const loaded = () => props.loadedIDs().has(skill.id)
               const color = () => loaded() ? loadedColor()
                 : skill.modelVisible === false ? props.theme().text.muted
@@ -142,8 +140,13 @@ export function SkillsPanel(props: SkillsPanelProps) {
                   <Show when={props.showAgentUsage?.() && usage()}>
                     {/* A sibling, not a child of the clickable row: no new mouse action. */}
                     <box width="100%" paddingLeft={2} flexShrink={0}>
-                      <text id={`skills-panel.${skill.id}.agents`} content={usage() ?? ""} width="100%" height={1} flexShrink={0}
-                        wrapMode="none" truncate fg={props.theme().text.muted} />
+                      <box id={`skills-panel.${skill.id}.agents`} width="100%" flexDirection="row" flexWrap="wrap" columnGap={1}>
+                        <For each={usageEntries()}>
+                          {(entry, index) => <text maxWidth="100%" flexShrink={0} wrapMode="word" fg={props.theme().text.muted}>
+                            {`${entry}${index() < usageEntries().length - 1 ? " ·" : ""}`}
+                          </text>}
+                        </For>
+                      </box>
                     </box>
                   </Show>
                 </>

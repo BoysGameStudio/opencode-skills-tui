@@ -255,7 +255,8 @@ test("deleting a child discards late history and descendants without affecting t
 test("history-only child loads survive parent permission filtering and loaded scope stays local", async () => {
   await withUsage(async (view) => {
     await view.waitForFrame((frame) => frame.includes("private-skill (subagent)"))
-    assert.match(view.captureCharFrame(), /explorer ×1 · subagent/)
+    assert.match(view.captureCharFrame(), /explorer ×1/)
+    assert.doesNotMatch(view.captureCharFrame(), /explorer ×1 · subagent/)
     assert.match(view.captureCharFrame(), /0 loaded/)
     assert.match(view.captureCharFrame(), /~0 tok/)
   }, {
@@ -458,22 +459,38 @@ test("session switching does not aggregate other sessions or reassign historical
   })
 })
 
-test("narrow rows truncate usage independently and keep the original token column", async () => {
+test("narrow rows wrap complete agent names and keep the original token column", async () => {
   await withUsage(async (view, host) => {
     await view.waitForFrame((frame) => frame.includes("argus ×2"))
     const row = node(view, "skills-panel.ui")
     const usage = node(view, "skills-panel.ui.agents")
     const tokens = node(view, "skills-panel.ui.tokens")
+    assert.match(view.captureCharFrame(), /unity-engineer ×3/)
     assert.equal(usage.y, row.y + 1)
-    assert.equal(usage.height, 1)
+    assert.ok(usage.height >= 2)
     assert.equal(tokens.y, row.y)
     host.setThemeMode("light")
     await view.flush()
-    assert.equal(node(view, "skills-panel.ui.agents").height, 1)
+    assert.ok(node(view, "skills-panel.ui.agents").height >= 2)
     host.mutateSettings((draft: any) => { draft.usage = "off" })
     await view.flush()
     assert.ok(view.renderer.root.findDescendantById("skills-panel.ui.tokens"))
   }, { width: 28, prefs: { token: "listing" } })
+})
+
+test("mixed parent and subagent usage stays readable without a redundant suffix", async () => {
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("explorer ×1"))
+    const frame = view.captureCharFrame()
+    assert.match(frame, /orchestrator ×1/)
+    assert.doesNotMatch(frame, /subagent|\.\.\.|…/)
+    assert.match(frame, /\(1\/1\)/)
+    assert.ok(node(view, "skills-panel.ui.agents").height >= 2)
+  }, {
+    width: 28,
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [message("parent", "orchestrator")], child: [message("child", "explorer")] },
+  })
 })
 
 test("history-discovered compaction cannot be undone by a stale cached stage", async () => {
