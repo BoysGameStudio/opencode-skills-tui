@@ -95,12 +95,14 @@ const makeContext = (overrides: {
       surface: () => context.theme,
     },
     client: {
+      session: { list: async () => ({ data: [], cursor: {} }) },
       message: { list: overrides.messageList ?? (async () => ({ data: [], cursor: {} })) },
       file: { list: overrides.fileList ?? (async () => ({ location: context.location, data: [] })) },
     },
     keymap: { layer: () => {}, commands: () => [], dispatch: () => {}, ...overrides.keymap },
     data: {
       session: {
+        list: () => [],
         get: (sessionID: string) => overrides.session ? overrides.session(sessionID) : { agent: "build", location: context.location },
         message: { list: (sessionID: string) => overrides.messages?.(sessionID) ?? [] },
       },
@@ -116,6 +118,7 @@ const makeContext = (overrides: {
         if (name === "skill.updated") skill.invalidate(event.location ?? context.location)
         callback(event)
       }) ?? (() => {}),
+      listen: () => () => {},
     },
     ui: {
       slot: overrides.slot ?? (() => () => {}),
@@ -2207,13 +2210,14 @@ test.each([0, 1, 2] as const)("preview normalizes CRLF and stays read-only even 
   Object.assign(context, { client: new Proxy(context.client, {
     get(target, key, receiver) {
       clientAccesses.push(key)
-      if (key !== "message" && key !== "file") throw new Error(`Preview must not access client.${String(key)}`)
+      if (key !== "message" && key !== "file" && key !== "session") throw new Error(`Preview must not access client.${String(key)}`)
       return Reflect.get(target, key, receiver)
     },
   }) })
   try {
     await withPanel(context, async (view) => {
       await view.waitForFrame((frame) => frame.includes("Review"))
+      const discoveryAccesses = clientAccesses.filter((key) => key === "session").length
       await view.mockMouse.click(4, 1, button)
       const dialogView = await testRender(() => dialogRender(), { width: 70, height: 24 })
       try {
@@ -2235,7 +2239,8 @@ test.each([0, 1, 2] as const)("preview normalizes CRLF and stays read-only even 
         expect(readFileSync(path, "utf8")).toBe(raw)
         expect(JSON.stringify({ skill, session })).toBe(before)
         expect(view.captureCharFrame()).toContain("Skills (0 loaded · 1 visible)")
-        expect(clientAccesses.every((key) => key === "message" || key === "file")).toBe(true)
+        expect(clientAccesses.every((key) => key === "message" || key === "file" || key === "session")).toBe(true)
+        expect(clientAccesses.filter((key) => key === "session").length).toBe(discoveryAccesses)
       } finally { dialogView.renderer.destroy() }
     }, { width: 70, height: 16 })
   } finally {

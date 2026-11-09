@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs"
 import type { Plugin } from "@opencode/plugin/tui"
 import { CliRenderEvents, CodeRenderable, InputRenderable, SyntaxStyle, TextAttributes, isRenderable } from "@opentui/core"
 import type { MouseEvent, Renderable } from "@opentui/core"
-import { Show, batch, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { Show, batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
 import type { Accessor } from "solid-js"
 import type { LocationRef } from "@opencode/client"
 import { useTerminalDimensions, useRenderer } from "@opentui/solid"
@@ -266,10 +266,73 @@ export default definePlugin({
     const compactionBySession = new Map<string, string>()
     const compactionTimeBySession = new Map<string, number>()
     const deletedSessions = new Set<string>()
+    const [parents, setParents] = createSignal(new Map<string, string>())
+    const discovering = new Map<string, AbortController>()
+    const discovered = new Set<string>()
+    const watched = new Map<string, number>()
+    const dirtyHistory = new Set<string>()
     let disposed = false
     let refreshID = 0
     let initialRefreshTimer: ReturnType<typeof setTimeout> | undefined
     let stopNativeSelection: (() => void) | undefined
+
+    const rememberParents = (sessions: readonly { id: string; parentID?: string }[]) => {
+      setParents((current) => {
+        const next = new Map(current)
+        for (const session of sessions) {
+          if (session.parentID && !deletedSessions.has(session.id)) next.set(session.id, session.parentID)
+        }
+        return next.size === current.size && [...next].every(([id, parent]) => current.get(id) === parent) ? current : next
+      })
+    }
+    const descendants = (root: string) => {
+      const result = new Set<string>()
+      const visit = (id: string) => {
+        if (result.has(id) || deletedSessions.has(id)) return
+        result.add(id)
+        for (const [child, parent] of parents()) if (parent === id) visit(child)
+      }
+      visit(root)
+      return result
+    }
+    // family() includes ancestors/siblings and only cached sessions. Query the
+    // native parentID index, one bounded page at a time, for each reachable node.
+    const discoverChildren = (sessionID: string) => {
+      if (disposed || deletedSessions.has(sessionID) || discovered.has(sessionID) || discovering.has(sessionID)) return
+      const controller = new AbortController()
+      discovering.set(sessionID, controller)
+      void (async () => {
+        let cursor: string | undefined
+        const cursors = new Set<string>()
+        do {
+          const page = await ctx.client.session.list({ parentID: sessionID, limit: 200, ...(cursor ? { cursor } : { order: "desc" as const }) })
+          if (disposed || controller.signal.aborted || discovering.get(sessionID) !== controller) return
+          rememberParents(page.data.filter((child) => child.parentID === sessionID))
+          cursor = page.cursor?.next ?? undefined
+          if (cursor && cursors.has(cursor)) throw new Error("Repeated session cursor")
+          if (cursor) cursors.add(cursor)
+        } while (cursor)
+        discovered.add(sessionID)
+      })().catch(() => {
+        // Keep known descendants; a later view/activity can retry discovery.
+      }).finally(() => {
+        if (discovering.get(sessionID) === controller) discovering.delete(sessionID)
+      })
+    }
+    const familyUsage = (sessionID: string) => {
+      const usage = new Map<string, readonly SkillInvocation[]>()
+      for (const id of descendants(sessionID)) {
+        for (const [message, calls] of usageBySession().get(id) ?? []) usage.set(JSON.stringify([id, message]), calls)
+      }
+      return summarizeSkillUsage(usage)
+    }
+    const childLoads = (sessionID: string) => {
+      const loaded = new Set<string>()
+      for (const id of descendants(sessionID)) {
+        if (id !== sessionID) for (const skill of loadedBySession().get(id) ?? []) loaded.add(skill)
+      }
+      return loaded
+    }
 
     const sampleKey = (skill: SkillSummary, location: LocationRef) => `${locationKey(location)}\0${skill.path}`
     const clearFileSamples = (location: LocationRef) => {
@@ -445,6 +508,10 @@ export default definePlugin({
             backfilling.delete(sessionID)
             backfillUsage.delete(sessionID)
           }
+          if (!disposed && dirtyHistory.delete(sessionID)) {
+            backfilled.delete(sessionID)
+            ensureBackfill(sessionID)
+          }
         })
     }
 
@@ -467,7 +534,10 @@ export default definePlugin({
         }
       }
       const previewSkill = createMemo(() => ({ ...skill, fileSamples: fileSamples().get(sampleKey(skill, location)) }))
-      const agentUsage = createMemo(() => summarizeSkillUsage(usageBySession().get(sessionID)).get(skill.id))
+      const agentUsage = createMemo(() => {
+        const usage = familyUsage(sessionID).get(skill.id)
+        return childLoads(sessionID).has(skill.id) ? `${usage ? `${usage} · ` : ""}subagent` : usage
+      })
       return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} agentUsage={agentUsage} theme={() => ctx.theme} renderer={ctx.renderer} />
     }
 
@@ -554,11 +624,46 @@ export default definePlugin({
     const unregisterSessionDeleted = ctx.data.on("session.deleted", (event) => {
       const sessionID = event.data.sessionID
       deletedSessions.add(sessionID)
+      // Tombstones alone are nonreactive. Publish topology even when this
+      // empty session has no load/usage entry to remove (it may bridge workers).
+      setParents((current) => {
+        const next = new Map(current)
+        next.delete(sessionID)
+        return next
+      })
+      discovering.get(sessionID)?.abort()
+      discovering.delete(sessionID)
+      dirtyHistory.delete(sessionID)
       resetLoaded(sessionID)
       compactionBySession.delete(sessionID)
       compactionTimeBySession.delete(sessionID)
       observedUsageBySession.delete(sessionID)
       observedMessageTimeBySession.delete(sessionID)
+    })
+
+    const unregisterCreated = ctx.data.on("session.created", (event) => {
+      rememberParents([{ id: event.data.sessionID, parentID: event.data.parentID }])
+    })
+    const unregisterActivity = ctx.data.listen(({ details }) => {
+      if (!["session.tool.success", "session.tool.failed", "session.skill.activated", "session.idle", "session.execution.started"].includes(details.type)) return
+      const sessionID = (details.data as { sessionID?: string }).sessionID
+      if (!sessionID || !watched.has(sessionID) || disposed || deletedSessions.has(sessionID)) return
+      if (details.type === "session.tool.success" || details.type === "session.tool.failed") {
+        const message = ctx.data.session.message.list(sessionID).find((message) => message.id === details.data.assistantMessageID)
+        const tool = message?.type === "assistant" ? message.content.find((part) => part.type === "tool" && part.id === details.data.id) : undefined
+        // The success/failure event has no tool name. Skip only proven non-skill
+        // calls; an uncached background call still needs a durable read.
+        if (tool?.type === "tool" && tool.name !== "skill") return
+      }
+      // Inactive/background sessions need durable reads too. Coalesce activity
+      // during an in-flight read into one follow-up, rather than losing resumes.
+      backfilled.delete(sessionID)
+      if (backfilling.has(sessionID)) dirtyHistory.add(sessionID)
+      else ensureBackfill(sessionID)
+      if (details.type === "session.idle" || details.type === "session.execution.started") {
+        discovered.delete(sessionID)
+        discoverChildren(sessionID)
+      }
     })
 
     const unregisterRevertCommitted = ctx.data.on("session.revert.committed", (event) => {
@@ -609,7 +714,7 @@ export default definePlugin({
       }
       const permissions = [...(agent?.permissions ?? []), ...(current?.permissions ?? [])]
       return {
-        skills: toSummaries(registered, permissions, loaded, mode).map((skill) => {
+        skills: toSummaries(registered, permissions, new Set([...loaded, ...(sessionID ? childLoads(sessionID) : [])]), mode).map((skill) => {
           const files = fileSamples().get(sampleKey(skill, location))
           return files === undefined ? skill : { ...skill, fileSamples: files }
         }),
@@ -724,7 +829,8 @@ export default definePlugin({
           // Read directory/workspace fields so moving the same Session also syncs.
           void refreshSkills({ directory: location.directory, workspaceID: location.workspaceID })
         })
-        const agentUsage = createMemo(() => summarizeSkillUsage(usageBySession().get(input.sessionID)))
+        const agentUsage = createMemo(() => familyUsage(input.sessionID))
+        const subagentLoaded = createMemo(() => childLoads(input.sessionID))
         const panel = createMemo(() => skillsView(input.sessionID, settings().scope, loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS))
         createEffect(() => {
           const location = session()?.location
@@ -736,8 +842,30 @@ export default definePlugin({
         // Slot renders run once, untracked. Effects follow its reactive Session
         // input and the message window instead of relying on claim re-renders.
         createEffect(() => {
-          applyLoads(input.sessionID, liveLoadState(input.sessionID))
-          ensureBackfill(input.sessionID)
+          const root = input.sessionID
+          untrack(() => {
+            for (const id of descendants(root)) {
+              discovered.delete(id)
+              backfilled.delete(id)
+            }
+          })
+        })
+        createEffect(() => rememberParents(ctx.data.session.list()))
+        createEffect(() => {
+          const ids = descendants(input.sessionID)
+          for (const id of ids) {
+            watched.set(id, (watched.get(id) ?? 0) + 1)
+            discoverChildren(id)
+            applyLoads(id, liveLoadState(id))
+            ensureBackfill(id)
+          }
+          onCleanup(() => {
+            for (const id of ids) {
+              const count = (watched.get(id) ?? 1) - 1
+              if (count) watched.set(id, count)
+              else watched.delete(id)
+            }
+          })
         })
 
         return (
@@ -750,6 +878,7 @@ export default definePlugin({
             tokenMode={() => settings().token}
             showAgentUsage={() => settings().usage === "on"}
             agentUsage={agentUsage}
+            subagentLoadedIDs={subagentLoaded}
             emptyMessage={() => panel().emptyMessage}
             loadedIDs={() => loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS}
             theme={() => ctx.theme}
@@ -775,6 +904,9 @@ export default definePlugin({
       stopNativeSelection?.()
       if (initialRefreshTimer !== undefined) clearTimeout(initialRefreshTimer)
       for (const controller of backfilling.values()) controller.abort()
+      for (const controller of discovering.values()) controller.abort()
+      discovering.clear()
+      dirtyHistory.clear()
       backfilling.clear()
       backfillUsage.clear()
       observedUsageBySession.clear()
@@ -790,6 +922,8 @@ export default definePlugin({
       unregisterSessionDeleted()
       unregisterRevertCommitted()
       unregisterCompactionEnded()
+      unregisterCreated()
+      unregisterActivity()
     }
   },
 })

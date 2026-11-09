@@ -24,13 +24,15 @@ const message = (id: string, agent: string, count = 1, created = 1) => ({
 /** Minimal host using the same rendered-test primitives as the existing suite. */
 async function withUsage(
   check: (view: Awaited<ReturnType<typeof testRender>>, host: any) => Promise<void>,
-  options: { width?: number; history?: (input: any) => Promise<any>; prefs?: Record<string, unknown>; initialMessages?: Record<string, any[]> } = {},
+  options: { width?: number; history?: (input: any) => Promise<any>; children?: (input: any) => Promise<any>; sessions?: { id: string; parentID?: string }[]; prefs?: Record<string, unknown>; initialMessages?: Record<string, any[]> } = {},
 ) {
   const [messages, setMessages] = createSignal<Record<string, any[]>>(options.initialMessages ?? { s1: [message("m1", "unity-engineer", 3), message("m2", "argus", 2)], s2: [message("m1", "other-agent")] })
   const [selected, select] = createSignal("s1")
   const [dialog, setDialog] = createSignal<(() => any) | undefined>()
   const [themeMode, setThemeMode] = createSignal("dark")
   const events = new Map<string, (event: any) => void>()
+  const listeners = new Set<(event: any) => void>()
+  const [sessions, setSessions] = createSignal(options.sessions ?? [{ id: "s1" }, { id: "s2" }])
   const layers: any[] = []
   let renderPanel!: (input: { sessionID: string }) => any
   let settings: any
@@ -60,6 +62,7 @@ async function withUsage(
       surface: () => context.theme,
     },
     client: {
+      session: { list: options.children ?? (async (input: any) => ({ data: sessions().filter((item) => item.parentID === input.parentID), cursor: {} })) },
       message: { list: options.history ?? (async () => ({ data: [], cursor: {} })) },
       file: { list: async () => ({ location: context.location, data: [] }) },
     },
@@ -70,10 +73,12 @@ async function withUsage(
         agent: { sync: async () => {}, list: () => [{ id: "build", permissions: [] }] },
       },
       session: {
+        list: sessions,
         get: () => ({ agent: "build", location: context.location }),
         message: { list: (id: string) => messages()[id] ?? [], invalidate: () => {}, sync: async () => {} },
       },
       on: (name: string, callback: (event: any) => void) => { events.set(name, callback); return () => events.delete(name) },
+      listen: (callback: (event: any) => void) => { listeners.add(callback); return () => listeners.delete(callback) },
     },
     keymap: { layer: (getLayer: () => any) => { layers.push(getLayer()) }, commands: () => [], dispatch: () => {} },
     ui: {
@@ -105,6 +110,11 @@ async function withUsage(
   ), { width: options.width ?? 120, height: 40 })
   const host = {
     context, events, layers, settings, mutateSettings, select, setThemeMode,
+    setSessions,
+    emit: (type: string, data: any) => {
+      events.get(type)?.({ type, data })
+      for (const listener of listeners) listener({ details: { type, data } })
+    },
     setMessages: (id: string, value: any[]) => setMessages((old) => ({ ...old, [id]: value })),
     commitRevert: (sessionID: string, to: string) => batch(() => {
       // Match the host projection: committed reverts remove messages at and after `to`.
@@ -119,6 +129,7 @@ async function withUsage(
     cleanup()
     view.renderer.destroy()
     assert.equal(events.size, 0)
+    assert.equal(listeners.size, 0)
   }
 }
 
@@ -155,6 +166,237 @@ test("sidebar adds only the usage line; it is not a new click target", async () 
     await view.flush()
     assert.match(view.captureCharFrame(), /Keep the existing interface/)
     assert.deepEqual(host.layers.flatMap((layer: any) => layer.commands).filter((command: any) => command.slash).map((command: any) => command.slash.name), ["skills-sidebar"])
+  })
+})
+
+test("completed child-only loads are paged recursively without importing siblings into a child view", async () => {
+  const requests: any[] = []
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("explorer ×2") && frame.includes("nested ×1") && frame.includes("parallel ×1"))
+    assert.match(view.captureCharFrame(), /UI \(subagent\)/)
+    assert.match(view.captureCharFrame(), /0 loaded/)
+    assert.doesNotMatch(view.captureCharFrame(), /unrelated/)
+    assert.ok(requests.some((input) => input.parentID === "s1" && input.cursor === "page2"))
+    await click(view, "skills-panel.ui")
+    await view.waitForFrame((frame) => frame.includes("agents:") && frame.includes("subagent"))
+    host.close()
+    host.select("child")
+    await view.waitForFrame((frame) => frame.includes("explorer ×2") && frame.includes("nested ×1") && !frame.includes("parallel"))
+    assert.match(view.captureCharFrame(), /1 loaded/)
+    host.select("s2")
+    await view.waitForFrame((frame) => frame.includes("unrelated ×1"))
+    assert.doesNotMatch(view.captureCharFrame(), /explorer|nested|parallel/)
+  }, {
+    initialMessages: { s1: [], s2: [message("same", "unrelated")] },
+    children: async (input) => {
+      requests.push(input)
+      const data = input.parentID === "s1" ? [{ id: input.cursor ? "parallel" : "child", parentID: "s1" }]
+        : input.parentID === "child" ? [{ id: "nested", parentID: "child" }] : []
+      return { data, cursor: input.parentID === "s1" && !input.cursor ? { next: "page2" } : {} }
+    },
+    history: async ({ sessionID }) => ({ data: sessionID === "child" ? [message("same", "explorer", 2)]
+      : ["nested", "parallel"].includes(sessionID) ? [message("same", sessionID)] : [], cursor: {} }),
+  })
+})
+
+test("late child discovery, duplicate delivery and resumed background history update the parent", async () => {
+  let count = 1
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("0 loaded"))
+    host.emit("session.created", { sessionID: "late", parentID: "s1" })
+    await view.waitForFrame((frame) => frame.includes("explorer ×1"))
+    host.emit("session.tool.success", { sessionID: "late" })
+    host.emit("session.tool.success", { sessionID: "late" })
+    await view.flush()
+    assert.doesNotMatch(view.captureCharFrame(), /explorer ×[2-9]/)
+    count = 2
+    host.emit("session.idle", { sessionID: "late" })
+    await view.waitForFrame((frame) => frame.includes("explorer ×2"))
+    assert.match(view.captureCharFrame(), /0 loaded/)
+  }, {
+    initialMessages: { s1: [] },
+    history: async ({ sessionID }) => ({ data: sessionID === "late" ? [message("m1", "explorer", count)] : [], cursor: {} }),
+  })
+})
+
+test("parent compaction and child compaction/revert have independent contributions", async () => {
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("parent ×1") && frame.includes("explorer ×2"))
+    host.setMessages("s1", [{ id: "c1", type: "compaction", status: "completed", time: { created: 10 } }])
+    await view.waitForFrame((frame) => frame.includes("explorer ×2") && !frame.includes("parent ×"))
+    assert.match(view.captureCharFrame(), /0 loaded/)
+    host.setMessages("child", [{ id: "c2", type: "compaction", status: "completed", time: { created: 10 } }, message("new", "resumed", 1, 20)])
+    await view.waitForFrame((frame) => frame.includes("resumed ×1") && !frame.includes("explorer"))
+    host.commitRevert("child", "new")
+    await view.waitForFrame((frame) => !frame.includes("resumed") && !frame.includes("subagent"))
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [message("p", "parent")], child: [message("old", "explorer", 2)] },
+  })
+})
+
+test("deleting a child discards late history and descendants without affecting the parent", async () => {
+  const pending = Promise.withResolvers<any>()
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("parent ×1") && frame.includes("explorer ×1"))
+    host.emit("session.deleted", { sessionID: "child" })
+    await view.waitForFrame((frame) => !frame.includes("explorer"))
+    pending.resolve({ data: [message("m1", "stale", 9)], cursor: {} })
+    await view.flush()
+    assert.match(view.captureCharFrame(), /parent ×1/)
+    assert.doesNotMatch(view.captureCharFrame(), /stale|explorer|subagent/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [message("p", "parent")], child: [message("m1", "explorer")] },
+    history: async ({ sessionID }) => sessionID === "child" ? pending.promise : { data: [], cursor: {} },
+  })
+})
+
+test("history-only child loads survive parent permission filtering and loaded scope stays local", async () => {
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("private-skill (subagent)"))
+    assert.match(view.captureCharFrame(), /explorer ×1 · subagent/)
+    assert.match(view.captureCharFrame(), /0 loaded/)
+    assert.match(view.captureCharFrame(), /~0 tok/)
+  }, {
+    prefs: { scope: "loaded", token: "load-delta" },
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [] },
+    history: async ({ sessionID }) => {
+      const call = message("m1", "explorer")
+      call.content[0]!.state.input.id = "private-skill"
+      return { data: sessionID === "child" ? [call] : [], cursor: {} }
+    },
+  })
+})
+
+test("late child history after revert cannot restore reverted calls", async () => {
+  const pending = Promise.withResolvers<any>()
+  let reads = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("explorer ×1"))
+    host.commitRevert("child", "m1")
+    await view.waitForFrame((frame) => !frame.includes("explorer") && !frame.includes("subagent"))
+    pending.resolve({ data: [message("m1", "stale", 9)], cursor: {} })
+    await view.flush()
+    assert.doesNotMatch(view.captureCharFrame(), /stale|explorer|subagent/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: [message("m1", "explorer")] },
+    history: async ({ sessionID }) => sessionID === "child" && ++reads === 1 ? pending.promise : { data: [], cursor: {} },
+  })
+})
+
+test("cleanup discards discovery/history replies and does not continue paging", async () => {
+  const children = Promise.withResolvers<any>()
+  const history = Promise.withResolvers<any>()
+  const requests: string[] = []
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("0 loaded"))
+  }, {
+    initialMessages: { s1: [] },
+    children: async ({ parentID }) => { requests.push(parentID); return children.promise },
+    history: async () => history.promise,
+  })
+  children.resolve({ data: [{ id: "late", parentID: "s1" }], cursor: { next: "next" } })
+  history.resolve({ data: [message("late", "stale")], cursor: { next: "next" } })
+  await Promise.all([children.promise, history.promise])
+  assert.deepEqual(requests, ["s1"])
+})
+
+test("deleting an empty intermediate bridge removes its worker's cached contribution", async () => {
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("explorer ×1") && frame.includes("UI (subagent)"))
+    host.emit("session.deleted", { sessionID: "bridge" })
+    await view.flush()
+    assert.doesNotMatch(view.captureCharFrame(), /explorer|subagent/)
+    assert.match(view.captureCharFrame(), /0 loaded/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "bridge", parentID: "s1" }, { id: "worker", parentID: "bridge" }],
+    initialMessages: { s1: [], bridge: [], worker: [message("m1", "explorer")] },
+  })
+})
+
+test.each(["first-page", "partial-page", "repeated-cursor"])("child discovery recovers from %s through session activity", async (failure) => {
+  let recover = false
+  const requests: any[] = []
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("0 loaded") && requests.filter((input) => input.parentID === "s1").length >= (failure === "first-page" ? 1 : 2))
+    await view.flush()
+    const before = requests.filter((input) => input.parentID === "s1").length
+    assert.equal(before, failure === "first-page" ? 1 : 2)
+    if (failure !== "first-page") assert.match(view.captureCharFrame(), /partial ×1/)
+    recover = true
+    host.emit("session.idle", { sessionID: "s1" })
+    await view.waitForFrame((frame) => frame.includes("recovered ×1"))
+    assert.ok(requests.filter((input) => input.parentID === "s1").length > before)
+    assert.doesNotMatch(view.captureCharFrame(), /unrelated/)
+  }, {
+    initialMessages: { s1: [] },
+    children: async (input) => {
+      requests.push(input)
+      if (input.parentID !== "s1") return { data: [], cursor: {} }
+      if (recover) return { data: [{ id: "recovered", parentID: "s1" }], cursor: {} }
+      if (failure === "first-page" || (failure === "partial-page" && input.cursor)) throw new Error("Discovery unavailable")
+      return { data: [{ id: "partial", parentID: "s1" }], cursor: { next: "repeat" } }
+    },
+    history: async ({ sessionID }) => ({ data: ["partial", "recovered"].includes(sessionID) ? [message("m1", sessionID)] : [], cursor: {} }),
+  })
+})
+
+test("tool activity during pending child history queues one follow-up with resumed calls", async () => {
+  const pending = Promise.withResolvers<any>()
+  let reads = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("0 loaded") && reads === 1)
+    host.emit("session.tool.success", { sessionID: "child", assistantMessageID: "m1", id: "call-1" })
+    host.emit("session.tool.success", { sessionID: "child", assistantMessageID: "m1", id: "call-1" })
+    assert.equal(reads, 1)
+    pending.resolve({ data: [message("m1", "explorer")], cursor: {} })
+    await view.waitForFrame((frame) => frame.includes("explorer ×2"))
+    assert.equal(reads, 2)
+    assert.match(view.captureCharFrame(), /0 loaded/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [] },
+    history: async ({ sessionID }) => sessionID !== "child" ? { data: [], cursor: {} } : ++reads === 1 ? pending.promise : { data: [message("m1", "explorer", 2)], cursor: {} },
+  })
+})
+
+test("permission-denied grammar-check in a child never appears as a load or usage", async () => {
+  const denied: any = message("denied", "explorer")
+  denied.content[0].state = { status: "error", input: { id: "grammar-check" }, error: { message: "Permission denied" } }
+  let reads = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("0 loaded") && reads > 0)
+    host.emit("session.tool.failed", { sessionID: "child", assistantMessageID: "denied", id: "call-0" })
+    await view.flush()
+    assert.doesNotMatch(view.captureCharFrame(), /grammar-check|explorer|subagent/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: [denied] },
+    history: async ({ sessionID }) => { if (sessionID === "child") reads++; return { data: sessionID === "child" ? [denied] : [], cursor: {} } },
+  })
+})
+
+test("known non-skill tool events and unrelated content edits do not rescan history", async () => {
+  const read = message("read", "explorer")
+  read.content[0]!.name = "read"
+  let reads = 0
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("0 loaded") && reads === 1)
+    await view.flush()
+    for (const type of ["session.tool.success", "session.tool.failed"]) {
+      host.emit(type, { sessionID: "child", assistantMessageID: "read", id: "call-0" })
+    }
+    host.emit("session.message.content.updated", { sessionID: "child", messageID: "read", content: read.content })
+    await view.flush()
+    assert.equal(reads, 1)
+    assert.doesNotMatch(view.captureCharFrame(), /explorer|subagent/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: [read] },
+    history: async ({ sessionID }) => { if (sessionID === "child") reads++; return { data: [], cursor: {} } },
   })
 })
 
@@ -454,6 +696,7 @@ test("a committed revert invalidates in-flight history without affecting another
     host.select("s1")
     await view.waitForFrame((frame) => frame.includes("0 loaded"))
     assert.doesNotMatch(view.captureCharFrame(), /stale-agent|unity-engineer|argus|other-agent/)
-    assert.equal(requests, 3)
+    // Returning to the view refreshes history to catch completed/background work.
+    assert.equal(requests, 4)
   }, { history: async () => ++requests === 1 ? pending.promise : { data: [], cursor: {} } })
 })

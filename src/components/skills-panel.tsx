@@ -17,6 +17,7 @@ export interface SkillsPanelProps {
   tokenMode: Accessor<SkillTokenMode>
   showAgentUsage?: Accessor<boolean>
   agentUsage?: Accessor<ReadonlyMap<string, string>>
+  subagentLoadedIDs?: Accessor<ReadonlySet<string>>
   /** All IDs loaded in the current stage, including skills hidden from the model listing. */
   loadedIDs: Accessor<Set<string>>
   emptyMessage: Accessor<string>
@@ -49,7 +50,7 @@ export function SkillsPanel(props: SkillsPanelProps) {
   const tokenLabel = (tokens: number | undefined) => tokens === undefined ? "-" : `~${formatTokenCount(tokens)} tok`
   // The total prices only what the model can auto-load; hidden skills keep row estimates.
   const totalTokens = createMemo(() => {
-    const visible = displayedSkills().filter((skill) => skill.modelVisible)
+    const visible = displayedSkills().filter((skill) => skill.modelVisible && (props.scope() !== "loaded" || props.loadedIDs().has(skill.id)))
     const mode = props.tokenMode()
     // No public API exposes the active skill tool definition; this total excludes that shared schema.
     if (mode === "listing") return tokenLabel(estimateSkillListingTotal(visible))
@@ -93,7 +94,10 @@ export function SkillsPanel(props: SkillsPanelProps) {
         >
           <For each={displayedSkills()}>
             {(skill) => {
-              const usage = () => props.agentUsage?.().get(skill.id)
+              const usage = () => {
+                const agents = props.agentUsage?.().get(skill.id)
+                return props.subagentLoadedIDs?.().has(skill.id) ? `${agents ? `${agents} · ` : ""}subagent` : agents
+              }
               const loaded = () => props.loadedIDs().has(skill.id)
               const color = () => loaded() ? loadedColor()
                 : skill.modelVisible === false ? props.theme().text.muted
@@ -127,7 +131,7 @@ export function SkillsPanel(props: SkillsPanelProps) {
                       truncate
                       fg={color()}
                     >
-                      {skill.name ?? skill.id}
+                      {`${skill.name ?? skill.id}${props.subagentLoadedIDs?.().has(skill.id) && !loaded() ? " (subagent)" : ""}`}
                     </text>
                     <Show when={props.tokenMode() !== "off"}>
                       <text id={`skills-panel.${skill.id}.tokens`} width={tokenWidth()} height={1} flexShrink={0} textAlign="right" fg={props.theme().text.muted}>
