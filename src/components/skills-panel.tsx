@@ -4,8 +4,8 @@ import { For, Show, createMemo, createSignal } from "solid-js"
 import type { Accessor } from "solid-js"
 import type { MouseEvent, ThemeMode } from "@opentui/core"
 import type { ResolvedTheme } from "@opencode/theme/tui"
-import type { SkillDisplayMode, SkillSummary, SkillTokenMode } from "../skill-data"
-import { estimateSkillTokens, estimateSkillListingTotal, formatTokenCount, sortSkillsByLoaded } from "../skill-data"
+import type { SkillDisplayMode, SkillSummary, SkillTokenMode, SkillUsageSummary } from "../skill-data"
+import { estimateSkillTokens, estimateSkillListingTotal, formatTokenCount, sortSkillsByLoaded, skillUsageLabel } from "../skill-data"
 
 export interface SkillsPanelProps {
   skills: Accessor<SkillSummary[]>
@@ -16,7 +16,8 @@ export interface SkillsPanelProps {
   showState: Accessor<boolean>
   tokenMode: Accessor<SkillTokenMode>
   showAgentUsage?: Accessor<boolean>
-  agentUsage?: Accessor<ReadonlyMap<string, string>>
+  agentUsage?: Accessor<ReadonlyMap<string, SkillUsageSummary>>
+  sessionID?: Accessor<string>
   subagentLoadedIDs?: Accessor<ReadonlySet<string>>
   /** All IDs loaded in the current stage, including skills hidden from the model listing. */
   loadedIDs: Accessor<Set<string>>
@@ -38,6 +39,7 @@ export function SkillsPanel(props: SkillsPanelProps) {
   })
   const loadedCount = createMemo(() => displayedSkills().filter((skill) => props.loadedIDs().has(skill.id)).length)
   const [stateWidth, setStateWidth] = createSignal(0)
+  const [expanded, setExpanded] = createSignal(new Set<string>())
   const totalCount = () => props.scope() === "registered" ? props.registeredCount() : props.modelVisibleCount()
   const fullState = () => props.scope() === "loaded" ? `(${loadedCount()} loaded)`
     : `(${loadedCount()} loaded · ${totalCount()} ${props.scope() === "registered" ? "registered" : "visible"})`
@@ -95,7 +97,9 @@ export function SkillsPanel(props: SkillsPanelProps) {
           <For each={displayedSkills()}>
             {(skill) => {
               const usage = () => props.agentUsage?.().get(skill.id)
-              const usageEntries = createMemo(() => usage()?.split(" · ") ?? [])
+              const hasUsage = () => props.showAgentUsage?.() && !!usage()?.total
+              const key = () => JSON.stringify([props.sessionID?.(), skill.id])
+              const isExpanded = () => expanded().has(key())
               const loaded = () => props.loadedIDs().has(skill.id)
               const color = () => loaded() ? loadedColor()
                 : skill.modelVisible === false ? props.theme().text.muted
@@ -114,10 +118,23 @@ export function SkillsPanel(props: SkillsPanelProps) {
                 <>
                   <box id={`skills-panel.${skill.id}`} width="100%" flexDirection="row" columnGap={1} onMouseUp={onRowMouseUp}>
                     <text
+                      id={`skills-panel.${skill.id}.toggle`}
                       flexShrink={0}
                       fg={color()}
+                      onMouseUp={(event: MouseEvent) => {
+                        if (!hasUsage()) return
+                        event.preventDefault()
+                        event.stopPropagation()
+                        if (event.button !== 0) return
+                        setExpanded((current) => {
+                          const next = new Set(current)
+                          if (next.has(key())) next.delete(key())
+                          else next.add(key())
+                          return next
+                        })
+                      }}
                     >
-                      {"•"}
+                      {hasUsage() ? isExpanded() ? "▼" : "▶" : "•"}
                     </text>
                     {/* Numeric height resets flexShrink; restore it afterwards. */}
                     <text
@@ -129,7 +146,7 @@ export function SkillsPanel(props: SkillsPanelProps) {
                       truncate
                       fg={color()}
                     >
-                      {`${skill.name ?? skill.id}${props.subagentLoadedIDs?.().has(skill.id) && !loaded() ? " (subagent)" : ""}`}
+                      {`${skill.name ?? skill.id}${hasUsage() ? ` ${skillUsageLabel(usage()!)}` : ""}${props.subagentLoadedIDs?.().has(skill.id) && !loaded() ? " (subagent)" : ""}`}
                     </text>
                     <Show when={props.tokenMode() !== "off"}>
                       <text id={`skills-panel.${skill.id}.tokens`} width={tokenWidth()} height={1} flexShrink={0} textAlign="right" fg={props.theme().text.muted}>
@@ -137,14 +154,15 @@ export function SkillsPanel(props: SkillsPanelProps) {
                       </text>
                     </Show>
                   </box>
-                  <Show when={props.showAgentUsage?.() && usage()}>
+                  <Show when={hasUsage() && isExpanded()}>
                     {/* A sibling, not a child of the clickable row: no new mouse action. */}
                     <box width="100%" paddingLeft={2} flexShrink={0}>
-                      <box id={`skills-panel.${skill.id}.agents`} width="100%" flexDirection="row" flexWrap="wrap" columnGap={1}>
-                        <For each={usageEntries()}>
-                          {(entry, index) => <text maxWidth="100%" flexShrink={0} wrapMode="word" fg={props.theme().text.muted}>
-                            {`${entry}${index() < usageEntries().length - 1 ? " ·" : ""}`}
-                          </text>}
+                      <box id={`skills-panel.${skill.id}.agents`} width="100%" flexDirection="column">
+                        <For each={usage()?.agents}>
+                          {(entry) => <box width="100%" flexDirection="row" columnGap={1} flexShrink={0}>
+                            <text flexGrow={1} minWidth={0} flexShrink={1} wrapMode="char" fg={props.theme().text.muted}>{entry.agentID ?? "Unknown agent"}</text>
+                            <text flexShrink={0} fg={props.theme().text.muted}>{`×${entry.count}`}</text>
+                          </box>}
                         </For>
                       </box>
                     </box>

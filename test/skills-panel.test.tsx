@@ -307,6 +307,34 @@ async function withSider(
   }
 }
 
+test.each([0, 1, 2] as const)("usage chevron never mentions; skill name retains native mention on button %i", async (button) => {
+  const context = makeContext({
+    prefs: { preview: "off", mention: ["left-click", "middle-click", "right-click"][button] },
+    skills: () => [{ id: "alpha", name: "alpha", content: "Instructions" }],
+    messages: () => [{ id: "m1", type: "assistant", agent: "engineer", time: { created: 1 }, content: [{
+      type: "tool", id: "call1", name: "skill", executed: false,
+      state: { status: "completed", input: { id: "alpha" }, content: [{ type: "text", text: '<skill_content name="alpha">\nInstructions' }] },
+    }] }],
+  })
+  await withSider(context, async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("▶ alpha (1 · 1 agent)"))
+    const toggle = view.renderer.root.findDescendantById("skills-panel.alpha.toggle")!
+    for (const clickButton of [0, 1, 2] as const) {
+      await view.mockMouse.click(toggle.x, toggle.y, clickButton)
+      await view.flush()
+      expect(host.dispatches).toEqual([])
+      expect(host.draft.skills).toEqual([])
+      expect(host.submits()).toBe(0)
+    }
+    const row = view.renderer.root.findDescendantById("skills-panel.alpha")!
+    await view.mockMouse.click(row.x + 3, row.y, button)
+    await view.waitForFrame(() => host.draft.skills.length === 1)
+    expect(host.dispatches).toEqual(["prompt.skills", "dialog.select.home", "dialog.select.submit"])
+    expect(host.draft.skills.map((skill) => skill.id)).toEqual(["alpha"])
+    expect(host.submits()).toBe(0)
+  })
+})
+
 test("left and right sidebar headers toggle on release without opening settings", async () => {
   let render!: (input: { sessionID: string }) => any
   let unregistered = false

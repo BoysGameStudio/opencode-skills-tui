@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs"
 import type { Plugin } from "@opencode/plugin/tui"
 import { CliRenderEvents, CodeRenderable, InputRenderable, SyntaxStyle, TextAttributes, isRenderable } from "@opentui/core"
 import type { MouseEvent, Renderable } from "@opentui/core"
-import { Show, batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+import { For, Show, batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
 import type { Accessor } from "solid-js"
 import type { LocationRef } from "@opencode/client"
 import { useTerminalDimensions, useRenderer } from "@opentui/solid"
@@ -22,7 +22,9 @@ import {
   loadSkillFileSamples,
   mergeSkillUsage,
   messagesAfterSkillCompaction,
-  summarizeSkillUsage,
+  countSkillUsage,
+  skillUsageLabel,
+  type SkillUsageSummary,
   toSummaries,
   type SkillDisplayMode,
   type SkillSummary,
@@ -83,7 +85,8 @@ function SkillPreviewDialog(props: {
   ctx: Plugin.Context
   skill: SkillSummary
   raw?: string
-  agentUsage: Accessor<string | undefined>
+  agentUsage: Accessor<SkillUsageSummary | undefined>
+  subagentLoaded: Accessor<boolean>
   theme: Accessor<ResolvedTheme>
   renderer: {
     getLinkAt: (x: number, y: number) => string | null
@@ -192,9 +195,13 @@ function SkillPreviewDialog(props: {
         <text width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>
           {`path: ${source}`}
         </text>
-        <text id="skills-preview.agents" width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>
-          {`agents: ${props.agentUsage() || "-"}`}
-        </text>
+        <box id="skills-preview.agents" width="100%" flexShrink={0} flexDirection="column">
+          <text width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>{`agents: ${props.agentUsage() ? skillUsageLabel(props.agentUsage()!) : "-"}${props.subagentLoaded() ? " · subagent load" : ""}`}</text>
+          <For each={props.agentUsage()?.agents}>{(agent) => <box width="100%" flexDirection="row" columnGap={1} flexShrink={0}>
+            <text flexGrow={1} minWidth={0} flexShrink={1} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>{agent.agentID ?? "Unknown agent"}</text>
+            <text flexShrink={0} fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC}>{`×${agent.count}`}</text>
+          </box>}</For>
+        </box>
         <box id="skills-preview.separator" width="100%" flexShrink={0} marginBottom={1}
           onSizeChange={function () { setSeparatorWidth(this.width) }}>
           <text content={separator()} width="100%" flexShrink={0} wrapMode="char" fg={props.theme().text.muted} bg={background()} attributes={TextAttributes.ITALIC} />
@@ -324,7 +331,14 @@ export default definePlugin({
       for (const id of descendants(sessionID)) {
         for (const [message, calls] of usageBySession().get(id) ?? []) usage.set(JSON.stringify([id, message]), calls)
       }
-      return summarizeSkillUsage(usage)
+      const localCallers = new Set<string>()
+      for (const calls of usageBySession().get(sessionID)?.values() ?? []) {
+        for (const call of calls) if (call.agentID !== null) localCallers.add(call.agentID)
+      }
+      const session = ctx.data.session.get(sessionID)
+      const location = session?.location ?? ctx.location ?? ctx.data.location.default()
+      const modes = new Map(ctx.data.location.agent.list(location)?.map((agent) => [agent.id, agent.mode]))
+      return countSkillUsage(usage, modes, localCallers)
     }
     const childLoads = (sessionID: string) => {
       const loaded = new Set<string>()
@@ -534,11 +548,8 @@ export default definePlugin({
         }
       }
       const previewSkill = createMemo(() => ({ ...skill, fileSamples: fileSamples().get(sampleKey(skill, location)) }))
-      const agentUsage = createMemo(() => {
-        const usage = familyUsage(sessionID).get(skill.id)
-        return childLoads(sessionID).has(skill.id) ? `${usage ? `${usage} · ` : ""}subagent` : usage
-      })
-      return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} agentUsage={agentUsage} theme={() => ctx.theme} renderer={ctx.renderer} />
+      const agentUsage = createMemo(() => familyUsage(sessionID).get(skill.id))
+      return <SkillPreviewDialog ctx={ctx} skill={previewSkill()} raw={raw} agentUsage={agentUsage} subagentLoaded={() => childLoads(sessionID).has(skill.id)} theme={() => ctx.theme} renderer={ctx.renderer} />
     }
 
     const openSkillPreview = (skill: SkillSummary, location: LocationRef, sessionID: string) => {
@@ -878,6 +889,7 @@ export default definePlugin({
             tokenMode={() => settings().token}
             showAgentUsage={() => settings().usage === "on"}
             agentUsage={agentUsage}
+            sessionID={() => input.sessionID}
             subagentLoadedIDs={subagentLoaded}
             emptyMessage={() => panel().emptyMessage}
             loadedIDs={() => loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS}

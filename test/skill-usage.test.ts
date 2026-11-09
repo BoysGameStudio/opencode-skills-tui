@@ -2,7 +2,7 @@ import { test } from "bun:test"
 import assert from "node:assert/strict"
 import type { Context } from "@opencode/plugin/tui/context"
 import {
-  backfillLoadedSkills, extractSkillLoadState, mergeSkillUsage, summarizeSkillUsage, messagesAfterSkillCompaction,
+  backfillLoadedSkills, extractSkillLoadState, mergeSkillUsage, summarizeSkillUsage, messagesAfterSkillCompaction, countSkillUsage, skillUsageLabel,
   type SkillUsage,
 } from "../src/skill-data"
 
@@ -18,6 +18,20 @@ const usage = (messages: readonly unknown[]) => extractSkillLoadState(messages, 
 const summary = (messages: readonly unknown[]) => summarizeSkillUsage(usage(messages))
 const compact = (id: string, status = "completed") => ({ id, type: "compaction", status })
 const context = (list: (input: any) => Promise<any>) => ({ client: { message: { list } } }) as unknown as Context
+
+test("primary callers sort first; known unclassified callers share nonprimary count ordering and missing attribution stays last", () => {
+  const agents = ["sub-z", "primary-b", "all-local", "primary-a", "all-child", "sub-a", "uncatalogued", undefined]
+  const counts = [8, 1, 2, 1, 3, 8, 20, 30]
+  const state = usage(agents.map((agent, index) => message(`m${index}`, agent, Array.from({ length: counts[index]! }, (_, i) => call(`c${i}`)))))
+  const modes = new Map([["sub-z", "subagent"], ["sub-a", "subagent"], ["primary-b", "primary"], ["primary-a", "primary"], ["all-local", "all"], ["all-child", "all"]])
+  const summary = countSkillUsage(state, modes, new Set(["all-local", "sub-z"])).get("ui")!
+  assert.deepEqual(summary.agents.map((agent) => [agent.agentID, agent.kind]), [
+    ["all-local", "primary"], ["primary-a", "primary"], ["primary-b", "primary"],
+    ["uncatalogued", "unclassified"], ["sub-a", "subagent"], ["sub-z", "subagent"], ["all-child", "subagent"], [null, "unclassified"],
+  ])
+  assert.equal(skillUsageLabel(summary), "(73 · 7 agents + unknown)")
+  assert.equal(skillUsageLabel(countSkillUsage(usage([message("unknown", undefined)])).get("ui")!), "(1 · 0 agents + unknown)")
+})
 
 test("counts successful calls by historical agent without changing distinct loaded counts", () => {
   const messages = [

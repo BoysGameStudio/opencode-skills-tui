@@ -310,19 +310,48 @@ export function mergeSkillUsage(previous: SkillUsage, incoming: SkillUsage): Ski
   return next ?? previous
 }
 
-/** Shared sidebar/preview text. IDs remain distinct; unknown is not a guessed agent. */
-export function summarizeSkillUsage(usage?: SkillUsage): Map<string, string> {
-  const skills = new Map<string, Map<string | null, number>>()
-  for (const calls of usage?.values() ?? []) {
-    for (const call of calls) {
-      let agents = skills.get(call.skillID)
-      if (!agents) skills.set(call.skillID, agents = new Map())
-      agents.set(call.agentID, (agents.get(call.agentID) ?? 0) + 1)
-    }
+export interface AgentUsageCount {
+  agentID: string | null
+  count: number
+  kind: "primary" | "subagent" | "unclassified"
+}
+
+export interface SkillUsageSummary {
+  total: number
+  agents: AgentUsageCount[]
+}
+
+/** Shared structured evidence; classification never rewrites invocation identity. */
+export function countSkillUsage(usage?: SkillUsage, modes: ReadonlyMap<string, string> = new Map(), localCallers: ReadonlySet<string> = new Set()): Map<string, SkillUsageSummary> {
+  const counts = new Map<string, Map<string | null, number>>()
+  for (const calls of usage?.values() ?? []) for (const call of calls) {
+    let agents = counts.get(call.skillID)
+    if (!agents) counts.set(call.skillID, agents = new Map())
+    agents.set(call.agentID, (agents.get(call.agentID) ?? 0) + 1)
   }
-  return new Map([...skills].map(([id, agents]) => [id, [...agents]
-    .sort(([a, ac], [b, bc]) => Number(a === null) - Number(b === null) || bc - ac || (a ?? "").localeCompare(b ?? ""))
-    .map(([agent, count]) => `${agent ?? "Unknown agent"} ×${count}`)
+  return new Map([...counts].map(([skill, counts]) => {
+    const agents: AgentUsageCount[] = [...counts].map(([agentID, count]) => {
+      const mode = agentID === null ? undefined : modes.get(agentID)
+      const kind = agentID === null ? "unclassified" : mode === "primary" ? "primary" : mode === "subagent" ? "subagent"
+        : localCallers.has(agentID) ? "primary" : mode === "all" ? "subagent" : "unclassified"
+      return { agentID, count, kind }
+    })
+    const rank = (agent: AgentUsageCount) => agent.agentID === null ? 2 : agent.kind === "primary" ? 0 : 1
+    agents.sort((a, b) => rank(a) - rank(b) || b.count - a.count || (a.agentID ?? "").localeCompare(b.agentID ?? ""))
+    return [skill, { total: agents.reduce((sum, agent) => sum + agent.count, 0), agents }]
+  }))
+}
+
+export function skillUsageLabel(usage: SkillUsageSummary): string {
+  const known = usage.agents.filter((agent) => agent.agentID !== null).length
+  const unknown = usage.agents.some((agent) => agent.agentID === null)
+  return `(${usage.total} · ${known} ${known === 1 ? "agent" : "agents"}${unknown ? " + unknown" : ""})`
+}
+
+/** Legacy text helper retained for callers outside the structured UI. */
+export function summarizeSkillUsage(usage?: SkillUsage): Map<string, string> {
+  return new Map([...countSkillUsage(usage)].map(([id, summary]) => [id, summary.agents
+    .map((agent) => `${agent.agentID ?? "Unknown agent"} ×${agent.count}`)
     .join(" · ")]))
 }
 
