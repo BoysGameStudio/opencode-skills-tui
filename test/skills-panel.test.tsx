@@ -71,7 +71,7 @@ const makeContext = (overrides: {
   const context = {
     location: { directory: process.cwd() },
     themeMode: "dark",
-    renderer: { clearSelection: overrides.clearSelection ?? (() => {}) },
+    renderer: { clearSelection: overrides.clearSelection ?? (() => {}), getSelection: () => null },
     storage: {
       store: (_key: string, options: { initial: object }) => {
         const [state, setState] = createStore(options.initial)
@@ -87,7 +87,7 @@ const makeContext = (overrides: {
       hue: { accent: { 200: white }, interactive: { 200: white } },
       categorical: [{ 200: white }],
       background: { base: white, action: { primary: { focused: white } } },
-      text: { base: white, muted: white, feedback: { success: { base: white }, error: { base: RGBA.fromHex("#ff5555") } } },
+      text: { base: white, muted: white, action: { primary: { focused: white } }, feedback: { success: { base: white }, error: { base: RGBA.fromHex("#ff5555") } } },
       markdown: {
         text: white, heading: white, strong: white, emphasis: white,
         listItem: white, blockQuote: white, code: white, link: white, linkText: white,
@@ -317,7 +317,7 @@ test.each([0, 1, 2] as const)("usage chevron never mentions; skill name retains 
     }] }],
   })
   await withSider(context, async (view, host) => {
-    await view.waitForFrame((frame) => frame.includes("▶ alpha (1 · 1 agent)"))
+    await view.waitForFrame((frame) => frame.includes("• alpha ▸1"))
     const toggle = view.renderer.root.findDescendantById("skills-panel.alpha.toggle")!
     for (const clickButton of [0, 1, 2] as const) {
       await view.mockMouse.click(toggle.x, toggle.y, clickButton)
@@ -333,6 +333,85 @@ test.each([0, 1, 2] as const)("usage chevron never mentions; skill name retains 
     expect(host.draft.skills.map((skill) => skill.id)).toEqual(["alpha"])
     expect(host.submits()).toBe(0)
   })
+})
+
+test("skill row hover applies the theme background across name, disclosure and token cells and clears on leave", async () => {
+  const context = makeContext({
+    prefs: { token: "listing" },
+    skills: () => [{ id: "alpha", name: "Alpha", description: "Instructions", content: "Body" }],
+    messages: () => [{ id: "m1", type: "assistant", agent: "engineer", content: [{
+      type: "tool", id: "call1", name: "skill", executed: false,
+      state: { status: "completed", input: { id: "alpha" }, content: [{ type: "text", text: '<skill_content name="Alpha">\nBody' }] },
+    }] }],
+  })
+  context.theme.background.action.primary.focused = RGBA.fromHex("#345678")
+  context.theme.text.muted = RGBA.fromHex("#888888")
+  context.theme.text.action.primary.focused = RGBA.fromHex("#ffffff")
+  await withPanel(context, async (view) => {
+    await view.waitForFrame((frame) => frame.includes("• Alpha ▸1"))
+    const row = view.renderer.root.findDescendantById("skills-panel.alpha")!
+    const disclosure = view.renderer.root.findDescendantById("skills-panel.alpha.toggle")!
+    const tokens = view.renderer.root.findDescendantById("skills-panel.alpha.tokens")!
+    expect(row.backgroundColor.a).toBe(0)
+    for (const x of [row.x + 3, disclosure.x, tokens.x]) {
+      await view.mockMouse.moveTo(x, row.y)
+      await view.flush()
+      expect(row.backgroundColor.equals(context.theme.background.action.primary.focused)).toBe(true)
+      const spans = view.captureSpans().lines[row.y].spans
+      for (const text of ["•", "Alpha", "▸1", "tok"]) {
+        const span = spans.find((entry) => entry.text.includes(text))!
+        expect(span.fg.equals(context.theme.text.action.primary.focused)).toBe(true)
+        expect(span.bg.equals(context.theme.background.action.primary.focused)).toBe(true)
+      }
+    }
+    await view.mockMouse.moveTo(row.x + 3, row.y + 2)
+    await view.flush()
+    expect(row.backgroundColor.a).toBe(0)
+    expect(view.captureSpans().lines[row.y].spans.find((span) => span.text.includes("Alpha"))!.fg.equals(context.theme.text.muted)).toBe(true)
+  })
+})
+
+test("disclosure handles two immediate clicks with the real renderer", async () => {
+  const context = makeContext({
+    skills: () => [{ id: "alpha", name: "Alpha", content: "Body" }],
+    messages: () => [{ id: "m1", type: "assistant", agent: "engineer", content: [{
+      type: "tool", id: "call1", name: "skill", executed: false,
+      state: { status: "completed", input: { id: "alpha" }, content: [{ type: "text", text: '<skill_content name="Alpha">\nBody' }] },
+    }] }],
+  })
+  await withSider(context, async (view) => {
+    await view.waitForFrame((frame) => frame.includes("• Alpha ▸1"))
+    const toggle = view.renderer.root.findDescendantById("skills-panel.alpha.toggle")!
+    expect(toggle.selectable).toBe(false)
+    await view.mockMouse.click(toggle.x, toggle.y)
+    await view.flush()
+    expect(view.captureCharFrame()).toContain("Alpha ▾1")
+    await view.mockMouse.click(toggle.x, toggle.y)
+    await view.flush()
+    expect(view.captureCharFrame()).toContain("Alpha ▸1")
+    expect(view.renderer.getSelection()?.getSelectedText() ?? "").toBe("")
+  })
+})
+
+test("36-column row retains disclosure count beside truncated name and token column", async () => {
+  const context = makeContext({
+    prefs: { token: "listing" },
+    skills: () => [{ id: "alpha", name: "extraordinarily-long-skill-name-for-narrow-terminal", content: "Body" }],
+    messages: () => [{ id: "m1", type: "assistant", agent: "engineer", content: Array.from({ length: 12 }, (_, i) => ({
+      type: "tool", id: `call${i}`, name: "skill", executed: false,
+      state: { status: "completed", input: { id: "alpha" }, content: [{ type: "text", text: '<skill_content name="alpha">\nBody' }] },
+    })) }],
+  })
+  await withSider(context, async (view) => {
+    await view.waitForFrame((frame) => frame.includes("▸12"))
+    const row = view.renderer.root.findDescendantById("skills-panel.alpha")!
+    const toggle = view.renderer.root.findDescendantById("skills-panel.alpha.toggle")!
+    const tokens = view.renderer.root.findDescendantById("skills-panel.alpha.tokens")!
+    const line = view.captureCharFrame().split("\n")[row.y]!
+    expect(line).toMatch(/^• extra.*\S ▸12\s+.*tok\s*$/)
+    expect(toggle.x + toggle.width).toBeLessThanOrEqual(tokens.x)
+    expect(tokens.x + tokens.width).toBeLessThanOrEqual(36)
+  }, { width: 36 })
 })
 
 test("left and right sidebar headers toggle on release without opening settings", async () => {
@@ -423,23 +502,23 @@ test("left and right sidebar headers toggle on release without opening settings"
       }
     }
     expect(clearSelectionCalls).toBe(0)
-    for (const button of [0, 2] as const) {
+    for (const button of [0, 1, 2] as const) {
       const before = dialogShown
       await view.mockMouse.pressDown(4, 1, button)
       expect(dialogShown).toBe(before)
       await view.mockMouse.release(4, 1, button)
       await view.flush()
-      expect(dialogShown).toBe(before + (button === 0 ? 1 : 0))
+      expect(dialogShown).toBe(before + (button === 1 ? 1 : 0))
       // Clear leftover selections so the host backdrop can dismiss on one click.
       expect(clearSelectionCalls).toBe(dialogShown)
       expect(view.captureCharFrame()).toContain("▼ Skills (2 loaded · 2 visible)")
     }
-    // Middle clicks keep their previous no-op behavior.
+    // Middle-click previews rows but never toggles the header.
     await view.mockMouse.click(4, 0, 1)
     await view.mockMouse.click(4, 1, 1)
     await view.flush()
     expect(view.captureCharFrame()).toContain("▼ Skills")
-    expect(dialogShown).toBe(1)
+    expect(dialogShown).toBe(2)
   } finally {
     cleanup()
     view.renderer.destroy()
@@ -521,7 +600,7 @@ test("preview dialog renders wrapped description and body without title or overl
   })
   await withPanel(context, async (view) => {
     await view.waitForFrame((frame) => frame.includes("find-skills"))
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const fromStyles = spyOn(SyntaxStyle, "fromStyles")
     const dialogView = await testRender(() => (
       <box width="100%" height={20}>{dialogRender()}</box>
@@ -563,7 +642,7 @@ test("preview dialog closes through its own modal escape binding", async () => {
   })
   await withPanel(context, async (view) => {
     await view.waitForFrame((frame) => frame.includes("alpha"))
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const dialogView = await testRender(() => (
       <box width="100%" height={20}>{dialogRender()}</box>
     ), { width: 110, height: 24 })
@@ -615,10 +694,11 @@ for (const initialMode of ["light", "dark"] as const) {
     await withPanel(context, async (view) => {
       await view.waitForFrame((frame) => frame.includes("alpha"))
       const sidebarSpans = view.captureSpans().lines.flatMap((line) => line.spans)
-      for (const text of ["Skills", "▼", "alpha", "•"]) {
+      for (const text of ["Skills", "▼"]) {
         expect(sidebarSpans.find((span) => span.text.includes(text))!.fg.equals(RGBA.fromHex(initialMode === "light" ? "#000000" : "#ffffff"))).toBe(true)
       }
-      await view.mockMouse.click(4, 1)
+      for (const text of ["alpha", "•"]) expect(sidebarSpans.find((span) => span.text.includes(text))!.fg.equals(RGBA.fromHex(palette().muted))).toBe(true)
+      await view.mockMouse.click(4, 1, 1)
       const dialogView = await testRender(() => dialogRender(), { width: 110, height: 40 })
       const nodes: (TextBufferRenderable | TextTableRenderable)[] = []
       const visit = (node: Renderable) => {
@@ -703,7 +783,7 @@ test("overview plugin data is italic and separated from the raw SKILL.md without
   try {
     await withPanel(context, async (view) => {
       await view.waitForFrame((frame) => frame.includes("find-skills"))
-      await view.mockMouse.click(4, 1)
+      await view.mockMouse.click(4, 1, 1)
       const dialogView = await testRender(() => (
         <box width="100%" height={20}>{dialogRender()}</box>
       ), { width: 110, height: 24 })
@@ -783,7 +863,7 @@ test.each([
   })
   await withPanel(context, async (view) => {
     await view.waitForFrame((frame) => frame.includes("opencode"))
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const dialogView = await testRender(() => dialogRender(), { width: 80, height: 24 })
     try {
       await waitForMarkdown(dialogView)
@@ -1204,24 +1284,24 @@ test.each(["manual", "auto"])("successful %s compaction removes loaded-only hidd
     const foreground = (name: string) => view.captureSpans().lines.flatMap((line) => line.spans)
       .find((span) => span.text.includes(name))!.fg
     await view.waitForFrame((frame) => frame.includes("Skills (2 loaded · 1 visible)"))
-    expect(foreground("alpha").equals(purple)).toBe(true)
-    expect(foreground("beta").equals(purple)).toBe(true)
+    expect(foreground("alpha").equals(context.theme.text.muted)).toBe(true)
+    expect(foreground("beta").equals(context.theme.text.muted)).toBe(true)
     const compaction = { id: "msg_compact", type: "compaction", reason, summary: "alpha and beta were loaded", recent: '<skill_content name="beta">' }
     for (const status of ["running", "failed"]) {
       setMessages([...old, { ...compaction, status }])
       await view.flush()
       expect(view.captureCharFrame()).toContain("Skills (2 loaded · 1 visible)")
-      expect(foreground("beta").equals(purple)).toBe(true)
+      expect(foreground("beta").equals(context.theme.text.muted)).toBe(true)
     }
     setMessages([...old, { ...compaction, status: "completed" }])
     events.get("session.compaction.ended")!({ data: { sessionID: "session-1", reason } })
     await view.waitForFrame((frame) => frame.includes("Skills (0 loaded · 1 visible)"))
-    expect(foreground("alpha").equals(white)).toBe(true)
+    expect(foreground("alpha").equals(context.theme.text.muted)).toBe(true)
     expect(view.captureCharFrame()).not.toContain("• beta")
     // A cache rescan and a preview must not revive the old loads.
     setMessages([...messages(), { id: "msg_plain", type: "user", text: "continue" }])
     await view.flush()
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     expect(view.captureCharFrame()).toContain("Skills (0 loaded · 1 visible)")
     expect(view.captureCharFrame()).not.toContain("• beta")
     await view.mockMouse.click(4, 0)
@@ -1238,8 +1318,8 @@ test.each(["manual", "auto"])("successful %s compaction removes loaded-only hidd
     await view.waitForFrame((frame) => frame.includes("Skills (1 loaded · 1 visible)"))
     await view.mockMouse.click(4, 0)
     await view.flush()
-    expect(foreground("alpha").equals(white)).toBe(true)
-    expect(foreground("beta").equals(purple)).toBe(true)
+    expect(foreground("alpha").equals(context.theme.text.muted)).toBe(true)
+    expect(foreground("beta").equals(context.theme.text.muted)).toBe(true)
     expect(view.captureCharFrame().indexOf("beta")).toBeLessThan(view.captureCharFrame().indexOf("alpha"))
   })
   expect(events.size).toBe(0)
@@ -1691,7 +1771,7 @@ test.each([
       expect(row).not.toContain(" tok")
       expect(view.captureCharFrame().split("\n").slice(2).join("\n").trim()).toBe("")
     }
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     expect(dialogShown).toBe(1)
   } finally {
     cleanup()
@@ -1825,7 +1905,7 @@ test("agent changes and session permission overrides immediately filter the mode
   }, { width: 50 })
 })
 
-test("unloaded visible skills stay black or white when theme text matches the loaded highlight", async () => {
+test("all skill rows stay muted independently of mode and loaded highlight", async () => {
   const [mode, setMode] = createSignal<"light" | "dark">("light")
   const highlight = RGBA.fromHex("#3b7dd8")
   const muted = RGBA.fromHex("#8b949e")
@@ -1848,7 +1928,7 @@ test("unloaded visible skills stay black or white when theme text matches the lo
       setMode(nextMode)
       await view.flush()
       const normal = RGBA.fromHex(nextMode === "light" ? "#000000" : "#ffffff")
-      for (const [id, name, color] of [["alpha", "Alpha", normal], ["beta", "Beta", highlight], ["gamma", "Gamma", muted], ["delta", "Delta", highlight]] as const) {
+      for (const [id, name, color] of [["alpha", "Alpha", muted], ["beta", "Beta", muted], ["gamma", "Gamma", muted], ["delta", "Delta", muted]] as const) {
         const row = view.renderer.root.findDescendantById(`skills-panel.${id}`)!
         const spans = view.captureSpans().lines[row.y].spans
         expect(spans.find((span) => span.text.includes(name))!.fg.equals(color)).toBe(true)
@@ -1863,7 +1943,7 @@ test("unloaded visible skills stay black or white when theme text matches the lo
   }, { width: 70 })
 })
 
-test("loaded rows match the theme picker selection, not accent or agent colors; header counts stay muted", async () => {
+test("loaded rows and header counts stay muted across theme and agent color changes", async () => {
   const orange = RGBA.fromHex("#fab283") // opencode dark primary highlight
   const blue = RGBA.fromHex("#3b7dd8") // opencode light primary highlight
   const [color, setColor] = createSignal(orange)
@@ -1901,23 +1981,23 @@ test("loaded rows match the theme picker selection, not accent or agent colors; 
     expect(view.captureCharFrame()).toContain("Skills (1 loaded · 2 visible)")
     expect(foreground("(").equals(context.theme.text.muted)).toBe(true)
     expect(foreground("1 loaded · 2 visible").equals(context.theme.text.muted)).toBe(true)
-    expect(foreground("beta").equals(orange)).toBe(true)
+    expect(foreground("beta").equals(context.theme.text.muted)).toBe(true)
     const bulletColor = () => view.captureSpans().lines[1].spans.find((span) => span.text.includes("•"))!.fg
-    expect(bulletColor().equals(orange)).toBe(true)
-    expect(foreground("alpha").equals(white)).toBe(true)
+    expect(bulletColor().equals(context.theme.text.muted)).toBe(true)
+    expect(foreground("alpha").equals(context.theme.text.muted)).toBe(true)
     setColor(blue)
     await view.flush()
     expect(foreground("Skills").equals(RGBA.fromHex("#000000"))).toBe(true)
     expect(foreground("▼").equals(RGBA.fromHex("#000000"))).toBe(true)
     expect(foreground("(").equals(context.theme.text.muted)).toBe(true)
     expect(foreground("1 loaded · 2 visible").equals(context.theme.text.muted)).toBe(true)
-    expect(foreground("beta").equals(blue)).toBe(true)
-    expect(bulletColor().equals(blue)).toBe(true)
-    expect(foreground("alpha").equals(RGBA.fromHex("#000000"))).toBe(true)
+    expect(foreground("beta").equals(context.theme.text.muted)).toBe(true)
+    expect(bulletColor().equals(context.theme.text.muted)).toBe(true)
+    expect(foreground("alpha").equals(context.theme.text.muted)).toBe(true)
     setAgentColor(RGBA.fromHex("#70b48f"))
     await view.flush()
-    expect(foreground("beta").equals(blue)).toBe(true)
-    expect(bulletColor().equals(blue)).toBe(true)
+    expect(foreground("beta").equals(context.theme.text.muted)).toBe(true)
+    expect(bulletColor().equals(context.theme.text.muted)).toBe(true)
     await view.mockMouse.click(4, 0)
     await view.waitForFrame((frame) => frame.includes("▶ Skills (1 loaded · 2 visible)"))
     expect(foreground("Skills").equals(RGBA.fromHex("#000000"))).toBe(true)
@@ -1934,7 +2014,7 @@ test("loaded rows match the theme picker selection, not accent or agent colors; 
   }, { width: 50 })
 })
 
-test("same-name skills share one label; only the loaded ID is colored and the preview tells them apart", async () => {
+test("same-name skills share muted labels; loaded-first order and preview tell them apart", async () => {
   const purple = RGBA.fromHex("#bc8cff")
   let dialogRender!: () => any
   const context = makeContext({
@@ -1949,12 +2029,13 @@ test("same-name skills share one label; only the loaded ID is colored and the pr
   await withPanel(context, async (view) => {
     await view.waitForFrame((frame) => (frame.match(/Review/g) ?? []).length === 2)
     const rows = view.captureSpans().lines.flatMap((line) => line.spans).filter((span) => span.text.includes("Review"))
-    expect(rows.map((row) => row.fg.equals(purple))).toEqual([true, false])
+    expect(rows.map((row) => row.fg.equals(context.theme.text.muted))).toEqual([true, true])
+    expect(view.renderer.root.findDescendantById("skills-panel.two")!.y).toBeLessThan(view.renderer.root.findDescendantById("skills-panel.one")!.y)
     await view.mockMouse.click(4, 0)
     await view.waitForFrame((frame) => frame.includes("▶ Skills (1 loaded · 2 visible)"))
     await view.mockMouse.click(4, 0)
     await view.waitForFrame((frame) => frame.includes("▼ Skills (1 loaded · 2 visible)"))
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const dialogView = await testRender(() => dialogRender(), { width: 60, height: 16 })
     try {
       await waitForMarkdown(dialogView)
@@ -1965,7 +2046,7 @@ test("same-name skills share one label; only the loaded ID is colored and the pr
   }, { width: 50 })
 })
 
-test("successful hidden loads retain one highlighted row per loaded ID, even after definitions disappear", async () => {
+test("successful hidden loads retain one muted row per loaded ID, even after definitions disappear", async () => {
   const visible = { id: "visible", name: "visible", description: "Visible", content: "" }
   const loaded = { id: "loaded", name: "loaded", description: "Loaded", content: "" }
   let available = [
@@ -2013,10 +2094,10 @@ test("successful hidden loads retain one highlighted row per loaded ID, even aft
     ])
     expect((frame.split("\n").slice(1).join("\n").match(/visible/g) ?? []).length).toBe(1)
     const rows = view.captureSpans().lines.slice(1).flatMap((line) => line.spans)
-    expect(rows.find((span) => span.text.includes("visible"))!.fg.equals(white)).toBe(true)
-    expect(rows.find((span) => span.text.includes("loaded"))!.fg.equals(purple)).toBe(true)
-    expect(highlightedRows().length).toBe(6)
-    expect(mutedRows().length).toBe(0)
+    expect(rows.find((span) => span.text.includes("visible"))!.fg.equals(context.theme.text.muted)).toBe(true)
+    expect(rows.find((span) => span.text.includes("loaded"))!.fg.equals(context.theme.text.muted)).toBe(true)
+    expect(highlightedRows().length).toBe(0)
+    expect(mutedRows().length).toBe(7)
     expect(frame).not.toContain("failed")
     expect(frame).toContain("▼ Skills (6 loaded · 2 visible)")
     await view.mockMouse.click(4, 0)
@@ -2033,8 +2114,8 @@ test("successful hidden loads retain one highlighted row per loaded ID, even aft
     await view.mockMouse.click(4, 0)
     await view.waitForFrame((frame) => frame.includes("• manual"))
     expect(view.captureCharFrame()).toContain("▼ Skills (6 loaded · 0 visible)")
-    expect(highlightedRows().length).toBe(6)
-    expect(mutedRows().length).toBe(0)
+    expect(highlightedRows().length).toBe(0)
+    expect(mutedRows().length).toBe(6)
     expect(view.captureCharFrame()).not.toContain("• visible")
     expect(view.captureCharFrame()).not.toContain("No model-visible skills")
     expect(view.captureCharFrame()).not.toContain(" tok")
@@ -2046,8 +2127,8 @@ test("successful hidden loads retain one highlighted row per loaded ID, even aft
     setMessages([...messages(), { type: "user", skills: [{ id: "manual" }, { id: "manual" }] }])
     await view.waitForFrame((frame) => frame.includes("Skills (1 loaded · 0 visible)"))
     expect(view.captureCharFrame()).toContain("• manual")
-    expect(highlightedRows().length).toBe(1)
-    expect(mutedRows().length).toBe(0)
+    expect(highlightedRows().length).toBe(0)
+    expect(mutedRows().length).toBe(1)
     expect(view.captureCharFrame()).not.toContain(" tok")
   })
 })
@@ -2075,10 +2156,10 @@ test.each(["tool", "attachment", "direct"])("hidden skills appear only after a s
     await view.waitForFrame((frame) => frame.includes("• Hidden"))
     expect(view.captureCharFrame()).toContain("Skills (1 loaded · 0 visible)")
     const row = view.captureSpans().lines[1].spans
-    expect(row.find((span) => span.text.includes("•"))!.fg.equals(purple)).toBe(true)
-    expect(row.find((span) => span.text.includes(skill.name))!.fg.equals(purple)).toBe(true)
+    expect(row.find((span) => span.text.includes("•"))!.fg.equals(context.theme.text.muted)).toBe(true)
+    expect(row.find((span) => span.text.includes(skill.name))!.fg.equals(context.theme.text.muted)).toBe(true)
     const before = JSON.stringify({ skill, messages: messages() })
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const dialogView = await testRender(() => dialogRender(), { width: 60, height: 16 })
     try {
       await waitForMarkdown(dialogView)
@@ -2179,7 +2260,7 @@ test.each([
   context.theme.text.base = RGBA.fromHex("#c9d1d9")
   await withPanel(context, async (view) => {
     await view.waitForFrame((frame) => frame.includes("• Stats"))
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const dialogView = await testRender(() => dialogRender(), { width: 100, height: 24 })
     try {
       await waitForMarkdown(dialogView)
@@ -2285,7 +2366,7 @@ test("preview Markdown exposes HTTP links through native renderer hit testing", 
   })
   await withPanel(context, async (view) => {
     await view.waitForFrame((frame) => frame.includes("Links"))
-    await view.mockMouse.click(4, 1)
+    await view.mockMouse.click(4, 1, 1)
     const dialogView = await testRender(() => dialogRender(), { width: 70, height: 16 })
     try {
       await waitForMarkdown(dialogView)
@@ -2327,7 +2408,7 @@ test.each([false, true])("Skills Sidebar groups clear setting labels without sea
     }
     expect(frame).not.toContain("ctrl+o")
     expect(frame).not.toContain("• One")
-    for (const [key, value] of [["Show sidebar", "on"], ["Display scope", "model-visible"], ["Token estimation", "off"], ["Header counts", "on"], ["Agent usage", "on"], ["Skill overview", "left-click"], ["Insert @mention", "right-click"]]) {
+    for (const [key, value] of [["Show sidebar", "on"], ["Display scope", "model-visible"], ["Token estimation", "off"], ["Header counts", "on"], ["Agent usage", "on"], ["Skill overview", "middle-click"], ["Insert @mention", "right-click"]]) {
       const row = frame.split("\n").find((line) => line.trim().startsWith(key))!
       expect(row.trimEnd().endsWith(value)).toBe(true)
     }
@@ -2352,19 +2433,19 @@ test.each([false, true])("Skills Sidebar groups clear setting labels without sea
     expect(host.draft.skills).toEqual([])
     await host.escape()
     host.open()
-    await view.waitForFrame((frame) => /Skill overview\s+left-click/.test(frame) && /Insert @mention\s+off/.test(frame))
+    await view.waitForFrame((frame) => /Skill overview\s+middle-click/.test(frame) && /Insert @mention\s+off/.test(frame))
     await host.escape()
     await host.change("preview", "enter")
     host.open()
-    await view.waitForFrame((frame) => /Skill overview\s+middle-click/.test(frame) && /Insert @mention\s+off/.test(frame))
+    await view.waitForFrame((frame) => /Skill overview\s+right-click/.test(frame) && /Insert @mention\s+off/.test(frame))
     view.mockInput.pressKey("HOME")
     for (let i = 0; i < 5; i++) view.mockInput.pressArrow("down")
-    for (const label of ["right-click", "off", "left-click", "middle-click"]) {
+    for (const label of ["off", "left-click", "middle-click", "right-click"]) {
       view.mockInput.pressEnter()
       await view.waitForFrame((frame) => new RegExp(`Skill overview\\s+${label}`).test(frame))
     }
     view.mockInput.pressArrow("left")
-    await view.waitForFrame((frame) => /Skill overview\s+left-click/.test(frame))
+    await view.waitForFrame((frame) => /Skill overview\s+middle-click/.test(frame))
     await host.escape()
     await host.change("token")
     host.open()
@@ -2505,7 +2586,7 @@ test("settings hover uses the native selection highlight; press selects and rele
   })
 })
 
-test("Header counts hides only header counts, preserving highlights and optional token totals", async () => {
+test("Header counts hides only header counts, preserving muted rows and optional token totals", async () => {
   const skill = { id: "one", name: "One", description: "One", path: "/builtin/one.md", content: "x".repeat(512) }
   const estimate = tokenLabel(estimateSkillTokens(skill, "load-delta"))
   const context = makeContext({
@@ -2519,7 +2600,7 @@ test("Header counts hides only header counts, preserving highlights and optional
     expect(view.captureCharFrame()).not.toContain("loaded")
     expect(view.captureCharFrame()).toContain(estimate)
     const row = view.captureSpans().lines.find((line) => line.spans.some((span) => span.text.includes("One")))!
-    expect(row.spans.some((span) => span.text.includes("One") && span.fg.equals(context.theme.background.action.primary.focused))).toBe(true)
+    expect(row.spans.some((span) => span.text.includes("One") && span.fg.equals(context.theme.text.muted))).toBe(true)
     await view.mockMouse.click(4, 0)
     await view.waitForFrame((frame) => frame.includes("▶ Skills"))
     expect(view.captureCharFrame()).toContain(estimate)
@@ -2555,8 +2636,8 @@ test("Show sidebar only hides the panel; Display scope retains loaded IDs and cu
     setMessages([...messages(), { type: "skill", skill: "removed-definition" }])
     await host.change("switch", "left")
     await view.waitForFrame((frame) => frame.includes("Skills (2 loaded)") && frame.includes("• removed-definition"))
-    const highlightedRows = () => view.captureSpans().lines.filter((line) => line.spans.some((span) => span.text.includes("•") && span.fg.equals(context.theme.surface("dialog").background.action.primary.focused)))
-    expect(highlightedRows().length).toBe(2)
+    const loadedRows = () => view.captureSpans().lines.filter((line) => line.spans.some((span) => span.text.includes("•") && span.fg.equals(context.theme.text.muted)))
+    expect(loadedRows().length).toBe(2)
     setMessages([...messages(), { id: "compact", type: "compaction", status: "running" }])
     await view.flush()
     expect(view.captureCharFrame()).toContain("• Manual")
@@ -2565,10 +2646,10 @@ test("Show sidebar only hides the panel; Display scope retains loaded IDs and cu
     expect(view.captureCharFrame()).toContain("2 loaded")
     setMessages([...messages(), { id: "compact-done", type: "compaction", status: "completed" }])
     await view.waitForFrame((frame) => frame.includes("Skills (0 loaded)") && frame.includes("No skills loaded"))
-    expect(highlightedRows().length).toBe(0)
+    expect(loadedRows().length).toBe(0)
     setMessages([...messages(), { type: "user", skills: [{ id: "manual" }] }])
     await view.waitForFrame((frame) => frame.includes("Skills (1 loaded)") && frame.includes("• Manual"))
-    expect(highlightedRows().length).toBe(1)
+    expect(loadedRows().length).toBe(1)
     await host.change("scope", "left")
     await view.waitForFrame((frame) => frame.includes("• Manual") && frame.includes("• Visible"))
     expect(view.captureCharFrame()).toContain("• No desc")
@@ -2608,15 +2689,15 @@ test("loaded hidden skills are pinned; unloaded hidden rows and token values sta
     const spans = (id: string) => view.captureSpans().lines[node(id)!.y].spans.filter((span) => span.text.trim())
     const expectManualHighlight = () => {
       const row = spans("manual")
-      expect(row.filter((span) => !span.text.includes("tok")).every((span) => span.fg.equals(context.theme.surface("dialog").background.action.primary.focused))).toBe(true)
+      expect(row.filter((span) => !span.text.includes("tok")).every((span) => span.fg.equals(muted()))).toBe(true)
       expect(row.filter((span) => span.text.includes("tok")).every((span) => span.fg.equals(muted()))).toBe(true)
     }
     await view.waitForFrame((frame) => frame.includes("Skills (2 loaded · 6 registered)"))
     expect(order()).toEqual(["loaded", "manual", "visible", "shared", "denied", "missing"])
     for (const id of ["denied", "missing"]) expect(spans(id).every((span) => span.fg.equals(muted()))).toBe(true)
     expectManualHighlight()
-    expect(spans("loaded").some((span) => span.text.includes("Zulu") && span.fg.equals(context.theme.surface("dialog").background.action.primary.focused))).toBe(true)
-    expect(spans("shared").some((span) => span.text.includes("Shared") && span.fg.equals(white))).toBe(true)
+    expect(spans("loaded").some((span) => span.text.includes("Zulu") && span.fg.equals(muted()))).toBe(true)
+    expect(spans("shared").some((span) => span.text.includes("Shared") && span.fg.equals(muted()))).toBe(true)
     setMuted(RGBA.fromHex("#6f767e"))
     await view.flush()
     for (const id of ["denied", "missing"]) expect(spans(id).every((span) => span.fg.equals(muted()))).toBe(true)
@@ -2624,7 +2705,7 @@ test("loaded hidden skills are pinned; unloaded hidden rows and token values sta
     setPermissions([{ action: "skill", resource: "denied", effect: "ask" }])
     await view.flush()
     expect(order()).toEqual(["loaded", "manual", "denied", "visible", "shared", "missing"])
-    expect(spans("denied").some((span) => span.text.includes("A denied") && span.fg.equals(white))).toBe(true)
+    expect(spans("denied").some((span) => span.text.includes("A denied") && span.fg.equals(muted()))).toBe(true)
     expect(view.captureCharFrame()).toContain("2 loaded · 6 registered")
     setScope("loaded")
     await view.flush()
@@ -2677,7 +2758,7 @@ test("grouped settings keep values aligned and keyboard selection visible in sho
   }, { width: 40, height: 14 })
 })
 
-test.each(["listing", "load-delta", "loaded-total"] as const)("%s token columns right-align, total visible IDs and avoid the absolute scrollbar", async (token) => {
+test.each(["listing", "load-delta", "loaded-total"] as const)("%s row estimates right-align while unloaded header totals stay zero and avoid the absolute scrollbar", async (token) => {
   const visible = { id: "long-id-" + "x".repeat(50), name: "Shared", description: "A", path: "/builtin/test.md", content: "x".repeat(512) }
   const hidden = { id: "manual", name: "Shared", description: "Manual", autoinvoke: false, content: "y".repeat(5200) }
   const [skills, setSkills] = createSignal([visible])
@@ -2715,14 +2796,12 @@ test.each(["listing", "load-delta", "loaded-total"] as const)("%s token columns 
       const line = view.captureCharFrame().split("\n")[row.y]
       expect(line.slice(row.x, row.x + row.width).trim()).toMatch(/^~[\d.]+k? tok$/)
       expect(line.slice(row.x, row.x + row.width).trim()).toBe(tokenLabel(estimateSkillTokens(visible, token)))
-      const expectedTotal = token === "listing" ? estimateSkillListingTotal([visible]) : token === "loaded-total"
-        ? estimateSkillListingTotal([visible])! + estimateSkillTokens(visible, "load-delta")! : estimateSkillTokens(visible, token)
-      expect(view.captureCharFrame().split("\n")[total.y].slice(total.x, total.x + total.width).trim()).toBe(tokenLabel(expectedTotal))
+      expect(view.captureCharFrame().split("\n")[total.y].slice(total.x, total.x + total.width).trim()).toBe("~0 tok")
     }
   } finally { cleanup(); view.renderer.destroy() }
 })
 
-test("token totals sum only model-visible skills across scopes, loads and registered updates", async () => {
+test("token totals sum displayed loaded skills including hidden loads across scopes and registered updates", async () => {
   let catalog = [
     { id: "one", name: "Shared", description: "One", path: "/builtin/one.md", content: "x".repeat(512) },
     { id: "manual", name: "Shared", description: "Manual", autoinvoke: false, path: "/builtin/manual.md", content: "y".repeat(5200) },
@@ -2735,23 +2814,23 @@ test("token totals sum only model-visible skills across scopes, loads and regist
     await view.waitForFrame((frame) => frame.includes(visibleLabel))
     await host.change("scope") // model -> registered
     await view.waitForFrame((frame) => frame.includes(label(catalog[1]))) // hidden manual keeps a row estimate
-    expect(cell(view, "skills-panel.total-tokens")).toBe(visibleLabel) // but never enters the total
+    expect(cell(view, "skills-panel.total-tokens")).toBe("~0 tok") // Neither available row is loaded.
     setMessages([{ type: "skill", skill: "manual" }])
     await host.change("scope") // registered -> loaded
     await view.waitForFrame((frame) => frame.includes("Skills (1 loaded)") && frame.includes(label(catalog[1])))
     expect(view.renderer.root.findDescendantById("skills-panel.one")).toBeUndefined()
-    expect(cell(view, "skills-panel.total-tokens")).toBe("~0 tok")
+    expect(cell(view, "skills-panel.total-tokens")).toBe(label(catalog[1]))
     catalog = [{ ...catalog[1], content: "z".repeat(800) }]
     context.data.location.skill.invalidate(context.location)
     await context.data.location.skill.sync(context.location)
     await view.waitForFrame((frame) => frame.includes(label(catalog[0])))
-    expect(cell(view, "skills-panel.total-tokens")).toBe("~0 tok")
+    expect(cell(view, "skills-panel.total-tokens")).toBe(label(catalog[0]))
     catalog = []
     context.data.location.skill.invalidate(context.location)
     await context.data.location.skill.sync(context.location)
     await view.waitForFrame((frame) => frame.includes("• manual")) // definition gone: ID-only row, estimate unknown
     expect(cell(view, "skills-panel.manual.tokens")).toBe("-")
-    expect(cell(view, "skills-panel.total-tokens")).toBe("~0 tok")
+    expect(cell(view, "skills-panel.total-tokens")).toBe("-")
     setMessages([...messages(), { id: "compact", type: "compaction", status: "completed" }])
     await view.waitForFrame((frame) => frame.includes("No skills loaded") && frame.includes("~0 tok"))
     await host.change("token") // load cost -> total cost
@@ -2761,20 +2840,23 @@ test("token totals sum only model-visible skills across scopes, loads and regist
   })
 })
 
-test("total cost includes visible list-entry guidance once plus each ordinary load without loading skills", async () => {
+test("total cost includes loaded listing guidance once plus each visible or hidden ordinary load without loading skills", async () => {
   const visible = [
     { id: "one", name: "One", description: "First", path: "/builtin/one.md", content: "Body one" },
     { id: "two", name: "Two", description: "Second", path: "/builtin/two.md", content: "Body two" },
   ]
   const hidden = { id: "hidden", name: "Hidden", description: "Manual", autoinvoke: false, path: "/builtin/manual.md", content: "Manual body" }
-  const context = makeContext({ skills: () => [...visible, hidden], prefs: { token: "loaded-total", scope: "registered" } })
-  const expected = estimateSkillListingTotal(visible)! + visible.reduce((sum, skill) => sum + estimateSkillTokens(skill, "load-delta")!, 0)
+  const [messages, setMessages] = createSignal<any[]>([...visible, hidden].map((skill) => ({ type: "skill", skill: skill.id })))
+  const context = makeContext({ skills: () => [...visible, hidden], messages, prefs: { token: "loaded-total", scope: "registered" } })
+  const expected = estimateSkillListingTotal(visible)! + [...visible, hidden].reduce((sum, skill) => sum + estimateSkillTokens(skill, "load-delta")!, 0)
   await withSider(context, async (view, host) => {
     await view.waitForFrame((frame) => frame.includes("• Hidden") && frame.includes(tokenLabel(expected)))
     expect(cell(view, "skills-panel.total-tokens")).toBe(tokenLabel(expected))
     for (const skill of visible) expect(cell(view, `skills-panel.${skill.id}.tokens`)).toBe(tokenLabel(estimateSkillTokens(skill, "loaded-total")))
     expect(cell(view, "skills-panel.hidden.tokens")).toBe(tokenLabel(estimateSkillTokens({ ...hidden, modelVisible: false }, "load-delta")))
-    expect(view.captureCharFrame()).toContain("0 loaded")
+    expect(view.captureCharFrame()).toContain("3 loaded")
+    setMessages([...messages(), { id: "compact", type: "compaction", status: "completed" }])
+    await view.waitForFrame((frame) => frame.includes("0 loaded") && cell(view, "skills-panel.total-tokens") === "~0 tok")
     await host.change("scope") // registered -> loaded-only; no actual loads, so no contribution.
     await view.waitForFrame((frame) => frame.includes("No skills loaded"))
     expect(cell(view, "skills-panel.total-tokens")).toBe("~0 tok")
@@ -2811,8 +2893,8 @@ test.each(["load-delta", "loaded-total"] as const)("%s columns and the overview 
   await withSider(context, async (view, host) => {
     await view.waitForFrame((frame) => frame.includes("• Sample"))
     expect(cell(view, "skills-panel.sample.tokens")).toBe("-")
-    expect(cell(view, "skills-panel.total-tokens")).toBe("-")
-    await view.mockMouse.click(4, 1)
+    expect(cell(view, "skills-panel.total-tokens")).toBe("~0 tok") // Unknown but unloaded payloads do not enter the header.
+    await view.mockMouse.click(4, 1, 1)
     await waitForMarkdown(view)
     expect(view.captureCharFrame()).toContain("load cost - · total cost -")
     pending.resolve({ location, data: [
@@ -2827,7 +2909,7 @@ test.each(["load-delta", "loaded-total"] as const)("%s columns and the overview 
     expect(view.captureCharFrame()).not.toContain("size:")
     await host.escape()
     const rowLabel = tokenLabel(estimateSkillTokens(sampled, mode))
-    const headerLabel = mode === "loaded-total" ? tokenLabel(estimateSkillListingTotal([sampled])! + estimateSkillTokens(sampled, "load-delta")!) : load
+    const headerLabel = "~0 tok"
     await view.waitForFrame((frame) => frame.includes(rowLabel) && frame.includes(headerLabel))
     expect(cell(view, "skills-panel.sample.tokens")).toBe(rowLabel)
     expect(cell(view, "skills-panel.total-tokens")).toBe(headerLabel)
@@ -3022,11 +3104,11 @@ test("durable settings reject mouse conflicts against the latest values from ano
   })
   await withSider(context, async (view, host) => {
     // Another terminal saves a valid pair before this TUI receives its refresh.
-    saved = { ...saved, preview: "off", mention: "middle-click" }
-    await host.change("preview") // Cached left-click -> middle-click now conflicts on disk.
+    saved = { ...saved, preview: "off", mention: "left-click" }
+    await host.change("preview", "left") // Cached middle-click -> left-click now conflicts on disk.
     await view.waitFor(() => toasts.length === 1)
     expect(toasts[0].message).toContain("Mouse button conflict")
-    expect(saved).toMatchObject({ preview: "off", mention: "middle-click" })
+    expect(saved).toMatchObject({ preview: "off", mention: "left-click" })
   })
 })
 
@@ -3035,11 +3117,11 @@ test("legacy memory displayMode is retained as scope when the new settings are f
   const context = makeContext({ storage: { memory: () => [state, (update: (draft: typeof state) => void) => setState(produce(update))] } })
   await withSider(context, async (view, host) => {
     host.open()
-    await view.waitForFrame((frame) => /Display scope\s+registered/.test(frame) && /Skill overview\s+left-click/.test(frame))
+    await view.waitForFrame((frame) => /Display scope\s+registered/.test(frame) && /Skill overview\s+middle-click/.test(frame))
     await host.escape()
     await host.change("token")
     host.open()
-    await view.waitForFrame((frame) => /Display scope\s+registered/.test(frame) && /Insert @mention\s+right-click/.test(frame) && /Skill overview\s+left-click/.test(frame))
+    await view.waitForFrame((frame) => /Display scope\s+registered/.test(frame) && /Insert @mention\s+right-click/.test(frame) && /Skill overview\s+middle-click/.test(frame))
     expect(host.submits()).toBe(0)
   })
 })

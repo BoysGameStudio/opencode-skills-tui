@@ -5,7 +5,7 @@ import type { Accessor } from "solid-js"
 import type { MouseEvent, ThemeMode } from "@opentui/core"
 import type { ResolvedTheme } from "@opencode/theme/tui"
 import type { SkillDisplayMode, SkillSummary, SkillTokenMode, SkillUsageSummary } from "../skill-data"
-import { estimateSkillTokens, estimateSkillListingTotal, formatTokenCount, sortSkillsByLoaded, skillUsageLabel } from "../skill-data"
+import { estimateSkillTokens, estimateSkillListingTotal, formatTokenCount, sortSkillsByLoaded } from "../skill-data"
 
 export interface SkillsPanelProps {
   skills: Accessor<SkillSummary[]>
@@ -21,6 +21,8 @@ export interface SkillsPanelProps {
   subagentLoadedIDs?: Accessor<ReadonlySet<string>>
   /** All IDs loaded in the current stage, including skills hidden from the model listing. */
   loadedIDs: Accessor<Set<string>>
+  canToggleRow?: Accessor<boolean>
+  hasSelection?: Accessor<boolean>
   emptyMessage: Accessor<string>
   theme: Accessor<ResolvedTheme>
   themeMode: Accessor<ThemeMode>
@@ -30,14 +32,17 @@ export interface SkillsPanelProps {
 }
 
 export function SkillsPanel(props: SkillsPanelProps) {
-  // Match the Themes picker selection, including dialog-specific overrides.
-  const loadedColor = () => props.theme().surface("dialog").background.action.primary.focused
   const normalColor = () => props.themeMode() === "light" ? "#000000" : "#ffffff"
   const displayedSkills = createMemo(() => {
     const loaded = props.loadedIDs()
     return sortSkillsByLoaded(props.skills(), loaded)
   })
-  const loadedCount = createMemo(() => displayedSkills().filter((skill) => props.loadedIDs().has(skill.id)).length)
+  const loadedSkills = createMemo(() => {
+    const local = props.loadedIDs()
+    const descendants = props.subagentLoadedIDs?.()
+    return [...new Map(displayedSkills().filter((skill) => local.has(skill.id) || descendants?.has(skill.id)).map((skill) => [skill.id, skill])).values()]
+  })
+  const loadedCount = () => loadedSkills().length
   const [stateWidth, setStateWidth] = createSignal(0)
   const [expanded, setExpanded] = createSignal(new Set<string>())
   const totalCount = () => props.scope() === "registered" ? props.registeredCount() : props.modelVisibleCount()
@@ -50,16 +55,15 @@ export function SkillsPanel(props: SkillsPanelProps) {
     return new Map(mode === "off" ? [] : displayedSkills().map((skill) => [skill.id, estimateSkillTokens(skill, mode)]))
   })
   const tokenLabel = (tokens: number | undefined) => tokens === undefined ? "-" : `~${formatTokenCount(tokens)} tok`
-  // The total prices only what the model can auto-load; hidden skills keep row estimates.
   const totalTokens = createMemo(() => {
-    const visible = displayedSkills().filter((skill) => skill.modelVisible && (props.scope() !== "loaded" || props.loadedIDs().has(skill.id)))
+    const loaded = loadedSkills()
     const mode = props.tokenMode()
-    // No public API exposes the active skill tool definition; this total excludes that shared schema.
-    if (mode === "listing") return tokenLabel(estimateSkillListingTotal(visible))
-    const counts = visible.map((skill) => mode === "loaded-total" ? estimateSkillTokens(skill, "load-delta") : estimates().get(skill.id))
+    if (mode === "off") return tokenLabel(0)
+    if (mode === "listing") return tokenLabel(estimateSkillListingTotal(loaded))
+    const counts = loaded.map((skill) => estimateSkillTokens(skill, "load-delta"))
     if (counts.some((count) => count === undefined)) return tokenLabel(undefined)
     const load = counts.reduce<number>((sum, count) => sum + count!, 0)
-    const listing = mode === "loaded-total" ? estimateSkillListingTotal(visible) : 0
+    const listing = mode === "loaded-total" ? estimateSkillListingTotal(loaded) : 0
     return tokenLabel(listing === undefined ? undefined : listing + load)
   })
   const tokenWidth = createMemo(() => Math.max(totalTokens().length, ...[...estimates().values()].map((count) => tokenLabel(count).length)))
@@ -100,10 +104,14 @@ export function SkillsPanel(props: SkillsPanelProps) {
               const hasUsage = () => props.showAgentUsage?.() && !!usage()?.total
               const key = () => JSON.stringify([props.sessionID?.(), skill.id])
               const isExpanded = () => expanded().has(key())
-              const loaded = () => props.loadedIDs().has(skill.id)
-              const color = () => loaded() ? loadedColor()
-                : skill.modelVisible === false ? props.theme().text.muted
-                : normalColor()
+              const [hovered, setHovered] = createSignal(false)
+              const color = () => hovered() ? props.theme().text.action.primary.focused : props.theme().text.muted
+              const toggle = () => setExpanded((current) => {
+                const next = new Set(current)
+                if (next.has(key())) next.delete(key())
+                else next.add(key())
+                return next
+              })
               // Open on mouseUp, not mouseDown: the host dialog's full-screen
               // backdrop closes the dialog on any mouseup it receives, so a
               // dialog opened during mousedown is dismissed by the release.
@@ -111,34 +119,25 @@ export function SkillsPanel(props: SkillsPanelProps) {
                 if (event.button !== 0 && event.button !== 1 && event.button !== 2) return
                 event.preventDefault()
                 event.stopPropagation()
+                if (event.button === 0 && hasUsage() && (props.canToggleRow?.() ?? true)) {
+                  if (!props.hasSelection?.()) toggle()
+                  return
+                }
                 props.onSkillClick(skill, event.button)
               }
 
               return (
                 <>
-                  <box id={`skills-panel.${skill.id}`} width="100%" flexDirection="row" columnGap={1} onMouseUp={onRowMouseUp}>
+                  <box id={`skills-panel.${skill.id}`} width="100%" flexDirection="row" columnGap={1} onMouseOver={() => setHovered(true)} onMouseOut={() => setHovered(false)} backgroundColor={hovered() ? props.theme().background.action.primary.focused : undefined} onMouseUp={onRowMouseUp}>
                     <text
-                      id={`skills-panel.${skill.id}.toggle`}
                       flexShrink={0}
                       fg={color()}
-                      onMouseUp={(event: MouseEvent) => {
-                        if (!hasUsage()) return
-                        event.preventDefault()
-                        event.stopPropagation()
-                        if (event.button !== 0) return
-                        setExpanded((current) => {
-                          const next = new Set(current)
-                          if (next.has(key())) next.delete(key())
-                          else next.add(key())
-                          return next
-                        })
-                      }}
                     >
-                      {hasUsage() ? isExpanded() ? "▼" : "▶" : "•"}
+                      •
                     </text>
+                    <box flexDirection="row" flexGrow={1} minWidth={0} flexShrink={1} columnGap={1}>
                     {/* Numeric height resets flexShrink; restore it afterwards. */}
                     <text
-                      flexGrow={1}
                       minWidth={0}
                       height={1}
                       flexShrink={1}
@@ -146,10 +145,20 @@ export function SkillsPanel(props: SkillsPanelProps) {
                       truncate
                       fg={color()}
                     >
-                      {`${skill.name ?? skill.id}${hasUsage() ? ` ${skillUsageLabel(usage()!)}` : ""}${props.subagentLoadedIDs?.().has(skill.id) && !loaded() ? " (subagent)" : ""}`}
+                      {skill.name ?? skill.id}
                     </text>
+                    <Show when={hasUsage()}>
+                      <text id={`skills-panel.${skill.id}.toggle`} selectable={false} flexShrink={0} fg={color()} onMouseUp={(event: MouseEvent) => {
+                        if (event.button !== 0 && event.button !== 1 && event.button !== 2) return
+                        event.preventDefault()
+                        event.stopPropagation()
+                        if (event.button !== 0 || props.hasSelection?.()) return
+                        toggle()
+                      }}>{`${isExpanded() ? "▾" : "▸"}${usage()!.total}`}</text>
+                    </Show>
+                    </box>
                     <Show when={props.tokenMode() !== "off"}>
-                      <text id={`skills-panel.${skill.id}.tokens`} width={tokenWidth()} height={1} flexShrink={0} textAlign="right" fg={props.theme().text.muted}>
+                      <text id={`skills-panel.${skill.id}.tokens`} width={tokenWidth()} height={1} flexShrink={0} textAlign="right" fg={color()}>
                         {tokenLabel(estimates().get(skill.id))}
                       </text>
                     </Show>
@@ -158,9 +167,9 @@ export function SkillsPanel(props: SkillsPanelProps) {
                     {/* A sibling, not a child of the clickable row: no new mouse action. */}
                     <box width="100%" paddingLeft={2} flexShrink={0}>
                       <box id={`skills-panel.${skill.id}.agents`} width="100%" flexDirection="column">
-                        <For each={usage()?.agents}>
+                        <For each={usage()?.sources ?? usage()?.agents.map((agent) => ({ label: agent.agentID ?? "Unknown agent", count: agent.count }))}>
                           {(entry) => <box width="100%" flexDirection="row" columnGap={1} flexShrink={0}>
-                            <text flexGrow={1} minWidth={0} flexShrink={1} wrapMode="char" fg={props.theme().text.muted}>{entry.agentID ?? "Unknown agent"}</text>
+                            <text flexGrow={1} minWidth={0} flexShrink={1} wrapMode="none" truncate fg={props.theme().text.muted}>{entry.label}</text>
                             <text flexShrink={0} fg={props.theme().text.muted}>{`×${entry.count}`}</text>
                           </box>}
                         </For>

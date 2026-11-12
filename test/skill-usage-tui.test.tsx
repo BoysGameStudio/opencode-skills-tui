@@ -7,6 +7,8 @@ import { CodeRenderable, RGBA } from "@opentui/core"
 import type { Renderable } from "@opentui/core"
 import { testRender, useRenderer } from "@opentui/solid"
 import type { Plugin } from "@opencode/plugin/tui"
+import { estimateSkillListingTotal, estimateSkillTokens, formatTokenCount } from "../src/skill-data"
+import type { SkillTokenMode } from "../src/skill-data"
 
 const { default: plugin } = await import(process.env.PLUGIN_TEST_ENTRY ?? "../src/tui")
 const white = RGBA.fromHex("#ffffff")
@@ -139,30 +141,169 @@ function node(view: Awaited<ReturnType<typeof testRender>>, id: string) {
   return found
 }
 
-test("usage title defaults collapsed with exact invocation and distinct-agent summary", async () => {
+function headerTokens(view: Awaited<ReturnType<typeof testRender>>) {
+  const total = node(view, "skills-panel.total-tokens")
+  return view.captureCharFrame().split("\n")[total.y].slice(total.x, total.x + total.width).trim()
+}
+
+function sidebarSources(view: Awaited<ReturnType<typeof testRender>>) {
+  const sources = node(view, "skills-panel.ui.agents")
+  return view.captureCharFrame().split("\n").slice(sources.y, sources.y + sources.height).map((row) => row.trim().replace(/\s+/g, " "))
+}
+
+test.each([0, 1])("a child named Current remains distinct from %i current-session calls", async (parentCount) => {
+  await withUsage(async (view, host) => {
+    await waitUsage(view, "Agent: Current ×2")
+    assert.deepEqual(sidebarSources(view), [...(parentCount ? ["Current ×1"] : []), "Agent: Current ×2"])
+    assert.match(view.captureCharFrame(), new RegExp(`• UI ▾${parentCount + 2}`))
+    host.setMessages("child", [message("child", "Current", 2)])
+    await view.flush()
+    assert.deepEqual(sidebarSources(view), [...(parentCount ? ["Current ×1"] : []), "Agent: Current ×2"])
+    await expectHistoricalUsage(view, host, parentCount ? "build ×1 · Current ×2" : "Current ×2", /Agent: Current/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: parentCount ? [message("parent", "build")] : [], child: [message("child", "Current", 2)] },
+  })
+})
+
+test("a child named Unknown agent is not merged with missing caller identity", async () => {
+  await withUsage(async (view, host) => {
+    await waitUsage(view, "Agent: Unknown agent ×2 · Unknown agent ×3")
+    assert.deepEqual(sidebarSources(view), ["Agent: Unknown agent ×2", "Unknown agent ×3"])
+    assert.match(view.captureCharFrame(), /• UI ▾5/)
+    await expectHistoricalUsage(view, host, "Unknown agent ×2 · Unknown agent ×3", /Agent: Unknown agent/)
+  }, {
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: [message("named", "Unknown agent", 2), { ...message("missing", "unused", 3), agent: undefined }] },
+  })
+})
+
+test("a long descendant source label preserves its count in a narrow expanded sidebar", async () => {
+  const agentID = "an-agent-with-an-unusually-long-full-descendant-identifier"
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("• UI ▸7"))
+    await click(view, "skills-panel.ui.toggle")
+    await view.waitForFrame((frame) => /an-agent-with.*×7/.test(frame))
+    const sources = node(view, "skills-panel.ui.agents")
+    assert.equal(sources.height, 1)
+    const [label, count] = sources.getChildren()[0].getChildren()
+    assert.equal(label.height, 1)
+    assert.ok(label.x + label.width <= count.x)
+    assert.ok(count.x + count.width <= 36)
+    assert.match(sidebarSources(view)[0], /^an-agent-with.* ×7$/)
+  }, {
+    width: 36, prefs: { token: "listing" },
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: [message("child", agentID, 7)] },
+  })
+})
+
+test("a hundred descendant roles remain separate in the expanded sidebar without a top-N cutoff", async () => {
+  const roles = Array.from({ length: 100 }, (_, index) => `role-${String(index).padStart(2, "0")}`)
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("• UI ▸100"))
+    assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
+    await click(view, "skills-panel.ui.toggle")
+    await view.waitForFrame((frame) => /role-99\s+×1/.test(frame))
+    assert.equal(node(view, "skills-panel.ui.agents").height, 100)
+    assert.deepEqual(sidebarSources(view), roles.map((role) => `${role} ×1`))
+    assert.match(view.captureCharFrame(), /• UI ▾100/)
+  }, {
+    height: 110,
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: roles.map((role) => message(role, role)) },
+  })
+})
+
+const headerModes = ["listing", "load-delta", "loaded-total", "off"] as const
+const headerCases = ["model", "registered", "loaded"].flatMap((scope) => headerModes.map((mode) => [scope, mode] as const))
+
+test.each(headerCases)("%s scope: %s header includes a known hidden child-only load, not an unloaded available row", async (scope, mode) => {
+  const hidden = { ...skill, autoinvoke: false, path: "/builtin/ui.md", content: "Known child body. ".repeat(80), modelVisible: false }
+  const unloaded = { id: "available", name: "Available", description: "Not loaded", path: "/builtin/available.md", content: "Not in totals".repeat(1000) }
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("• UI ▸3") && frame.includes("1 loaded"))
+    if (mode === "off") {
+      assert.ok(!view.renderer.root.findDescendantById("skills-panel.total-tokens"))
+      assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.tokens"))
+      return
+    }
+    const load = estimateSkillTokens(hidden, "load-delta")!
+    assert.ok(load > 0)
+    const expected = mode === "listing" ? 0 : load
+    assert.equal(headerTokens(view), `~${formatTokenCount(expected)} tok`)
+    assert.equal(view.captureCharFrame().includes("• Available"), scope !== "loaded")
+  }, {
+    skills: [hidden, unloaded], prefs: { scope, token: mode },
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [], child: [message("child-call", "explorer", 3)] },
+  })
+})
+
+test.each(headerModes)("%s header counts parent/child overlap once and repeat invocations do not multiply content", async (mode) => {
+  const known = { ...skill, path: "/builtin/ui.md", modelVisible: true }
+  const expected = (token: Exclude<SkillTokenMode, "off">) => {
+    const listing = estimateSkillListingTotal([known])!
+    const load = estimateSkillTokens(known, "load-delta")!
+    return `~${formatTokenCount(token === "listing" ? listing : token === "load-delta" ? load : listing + load)} tok`
+  }
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("• UI ▸5") && frame.includes("1 loaded · 1 visible"))
+    if (mode !== "off") assert.equal(headerTokens(view), expected(mode))
+    else assert.ok(!view.renderer.root.findDescendantById("skills-panel.total-tokens"))
+    host.setMessages("child", [message("child-call", "explorer", 8)])
+    await view.waitForFrame((frame) => frame.includes("• UI ▸10"))
+    assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
+    if (mode !== "off") assert.equal(headerTokens(view), expected(mode))
+    else assert.ok(!view.renderer.root.findDescendantById("skills-panel.total-tokens"))
+  }, {
+    skills: [known], prefs: { token: mode },
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [message("parent-call", "build", 2)], child: [message("child-call", "explorer", 3)] },
+  })
+})
+
+test.each(["load-delta", "loaded-total"] as const)("%s header is unknown rather than a partial sum when a loaded child payload is missing", async (mode) => {
+  const unknown = message("unknown", "explorer")
+  unknown.content[0]!.state.input.id = "unregistered"
+  await withUsage(async (view) => {
+    await view.waitForFrame((frame) => frame.includes("2 loaded") && frame.includes("• unregistered ▸1"))
+    assert.equal(headerTokens(view), "-")
+    assert.ok(estimateSkillTokens({ ...skill, path: "/builtin/ui.md" }, "load-delta")! > 0)
+    assert.doesNotMatch(view.captureCharFrame().split("\n")[0], /~0 tok/)
+  }, {
+    skills: [{ ...skill, path: "/builtin/ui.md" }], prefs: { token: mode },
+    sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
+    initialMessages: { s1: [message("known", "build")], child: [unknown] },
+  })
+})
+
+test("usage title defaults collapsed with exact invocation total", async () => {
   await withUsage(async (view) => {
     await view.waitForFrame((frame) => frame.includes("UI"))
-    assert.match(view.captureCharFrame(), /▶ UI \(13 · 4 agents\)/)
+    assert.match(view.captureCharFrame(), /• UI ▸13/)
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
   }, { initialMessages: { s1: [message("a", "orchestrator"), message("b", "explorer", 8), message("c", "oracle", 3), message("d", "fixer")] } })
 })
 
-test("sidebar and overview share primary-first vertical counts across repeated child roles", async () => {
+test("sidebar sources sum to total and family header deduplicates overlapping parent/child loads; preview retains attribution", async () => {
   await withUsage(async (view, host) => {
-    await view.waitForFrame((frame) => frame.includes("▶ UI (13 · 4 agents)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▸13"))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
     await click(view, "skills-panel.ui.toggle")
-    await view.waitForFrame((frame) => usagePattern("orchestrator ×1 · explorer ×8 · oracle ×3 · fixer ×1").test(frame))
+    await view.waitForFrame((frame) => usagePattern("Current ×1 · explorer ×8 · oracle ×3 · fixer ×1").test(frame))
     const agents = node(view, "skills-panel.ui.agents")
     assert.equal(agents.height, 4)
     assert.equal(host.dialog(), undefined)
     const rows = view.captureCharFrame().split("\n").slice(agents.y, agents.y + agents.height).map((row) => row.trim().replace(/\s+/g, " "))
-    assert.deepEqual(rows, ["orchestrator ×1", "explorer ×8", "oracle ×3", "fixer ×1"])
-    await click(view, "skills-panel.ui")
+    assert.deepEqual(rows, ["Current ×1", "explorer ×8", "oracle ×3", "fixer ×1"])
+    assert.equal(rows.reduce((sum, row) => sum + Number(row.split("×")[1]), 0), 13)
+    assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
+    await click(view, "skills-panel.ui", 1)
     await view.waitForFrame((frame) => frame.includes("agents: (13 · 4 agents)"))
     const preview = node(view, "skills-preview.agents")
     const previewRows = view.captureCharFrame().split("\n").slice(preview.y + 1, preview.y + preview.height).map((row) => row.trim().replace(/\s+/g, " "))
-    assert.deepEqual(previewRows, rows)
+    assert.deepEqual(previewRows, ["orchestrator ×1", "explorer ×8", "oracle ×3", "fixer ×1"])
     host.close()
     await click(view, "skills-panel.ui.toggle")
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
@@ -177,20 +318,20 @@ test("independent folds remain collapsed on updates and are scoped by viewed ses
   const second = message("second", "argus", 2)
   second.content.forEach((call) => { call.state.input.id = "second" })
   await withUsage(async (view, host) => {
-    await view.waitForFrame((frame) => frame.includes("▶ UI (1 · 1 agent)") && frame.includes("▶ Second (2 · 1 agent)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▸1") && frame.includes("• Second ▸2"))
     await click(view, "skills-panel.ui.toggle")
     assert.ok(view.renderer.root.findDescendantById("skills-panel.ui.agents"))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.second.agents"))
     host.setMessages("s1", [message("m1", "explorer", 4), second])
-    await view.waitForFrame((frame) => frame.includes("▼ UI (4 · 1 agent)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▾4"))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.second.agents"))
     host.select("s2")
-    await view.waitForFrame((frame) => frame.includes("▶ UI (1 · 1 agent)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▸1"))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
     host.select("s1")
-    await view.waitForFrame((frame) => frame.includes("▼ UI (4 · 1 agent)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▾4"))
     host.mutateSettings((draft: any) => { draft.usage = "off" })
-    await view.waitForFrame((frame) => frame.includes("• UI") && !frame.includes("4 · 1 agent"))
+    await view.waitForFrame((frame) => frame.includes("• UI") && !/[▸▾]\d/.test(frame))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
   }, {
     skills: [skill, { ...skill, id: "second", name: "Second" }],
@@ -200,7 +341,7 @@ test("independent folds remain collapsed on updates and are scoped by viewed ses
 
 test.each([0, 1, 2] as const)("chevron consumes button %i without preview or mention; name keeps configured preview", async (button) => {
   await withUsage(async (view, host) => {
-    await view.waitForFrame((frame) => frame.includes("▶ UI"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▸5"))
     let dispatches = 0
     host.context.keymap.dispatch = () => { dispatches++ }
     await click(view, "skills-panel.ui.toggle", button)
@@ -213,7 +354,22 @@ test.each([0, 1, 2] as const)("chevron consumes button %i without preview or men
   }, { prefs: { preview: ["left-click", "middle-click", "right-click"][button], mention: ["middle-click", "right-click", "left-click"][button] } })
 })
 
-test.each([28, 40, 60])("vertical usage retains full long IDs and title/token columns do not overlap at width %i", async (width) => {
+test("unassigned left-click toggles the name row without preview or mention", async () => {
+  await withUsage(async (view, host) => {
+    await view.waitForFrame((frame) => frame.includes("• UI ▸5"))
+    let dispatches = 0
+    host.context.keymap.dispatch = () => { dispatches++ }
+    await click(view, "skills-panel.ui")
+    await view.waitForFrame((frame) => /Current\s+×5/.test(frame))
+    assert.equal(host.dialog(), undefined)
+    assert.equal(dispatches, 0)
+    await click(view, "skills-panel.ui")
+    await view.waitForFrame((frame) => frame.includes("• UI ▸5"))
+    assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
+  })
+})
+
+test.each([28, 36, 40, 60])("current usage and title/token columns do not overlap at width %i", async (width) => {
   const name = "an-agent-with-an-unusually-long-full-historical-identifier"
   await withUsage(async (view) => {
     await view.waitForFrame((frame) => frame.includes("UI"))
@@ -226,27 +382,41 @@ test.each([28, 40, 60])("vertical usage retains full long IDs and title/token co
     await view.flush()
     const agents = node(view, "skills-panel.ui.agents")
     const content = view.captureCharFrame().split("\n").slice(agents.y, agents.y + agents.height).join("").replace(/\s|×1/g, "")
-    assert.equal(content, name)
+    assert.equal(content, "Current")
+    assert.match(view.captureCharFrame().split("\n")[row.y], /• UI ▾1\s+~\d+ tok/)
     assert.doesNotMatch(view.captureCharFrame().split("\n").slice(agents.y, agents.y + agents.height).join(""), /…|\.\.\./)
+    await click(view, "skills-panel.ui", 1)
+    await view.waitForFrame(() => {
+      const preview = view.renderer.root.findDescendantById("skills-preview.agents")
+      if (!preview) return false
+      const rows = view.captureCharFrame().split("\n").slice(preview.y + 1, preview.y + preview.height).join("")
+      return rows.replace(/\s|×1/g, "") === name
+    })
   }, { width, prefs: { token: "listing" }, initialMessages: { s1: [message("m1", name)] } })
 })
 
 test("a hundred agents do not autoexpand and expanded list has no top-N cutoff", async () => {
   await withUsage(async (view) => {
-    await view.waitForFrame((frame) => frame.includes("▶ UI (100 · 100 agents)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▸100"))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
     await click(view, "skills-panel.ui.toggle")
+    await view.waitForFrame((frame) => /Current\s+×100/.test(frame))
+    assert.equal(node(view, "skills-panel.ui.agents").height, 1)
+    await click(view, "skills-panel.ui", 1)
     await view.waitForFrame((frame) => /agent-99\s+×1/.test(frame))
-    assert.equal(node(view, "skills-panel.ui.agents").height, 100)
+    assert.equal(node(view, "skills-preview.agents").height, 101)
   }, { height: 110, initialMessages: { s1: Array.from({ length: 100 }, (_, i) => message(`m${i}`, `agent-${String(i).padStart(2, "0")}`)) } })
 })
 
 test("unknown attribution is not a claimed distinct identity and stays last", async () => {
   const unknown = { ...message("u", "unused", 5), agent: undefined }
   await withUsage(async (view) => {
-    await view.waitForFrame((frame) => frame.includes("▶ UI (6 · 1 agent + unknown)"))
+    await view.waitForFrame((frame) => frame.includes("• UI ▸6"))
     await click(view, "skills-panel.ui.toggle")
+    await view.waitForFrame((frame) => usagePattern("Current ×6").test(frame))
+    await click(view, "skills-panel.ui", 1)
     await view.waitForFrame((frame) => usagePattern("explorer ×1 · Unknown agent ×5").test(frame))
+    assert.match(view.captureCharFrame(), /agents: \(6 · 1 agent \+ unknown\)/)
     assert.doesNotMatch(view.captureCharFrame(), /unused/)
   }, { initialMessages: { s1: [unknown, message("e", "explorer")] } })
 })
@@ -257,7 +427,7 @@ test("attachments or failed calls without successful invocations have no usage c
   await withUsage(async (view) => {
     await view.waitForFrame((frame) => frame.includes("• UI"))
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
-    assert.doesNotMatch(view.captureCharFrame(), /agents\)|▶ UI/)
+    assert.doesNotMatch(view.captureCharFrame(), /agents\)|[▸▾]\d/)
   }, { initialMessages: { s1: [failed, { id: "user", type: "user", content: [{ type: "skill", id: "ui" }] }] } })
 })
 
@@ -273,21 +443,37 @@ function usagePattern(text: string): RegExp {
 
 /** History regressions explicitly open the new default-collapsed presentation. */
 async function waitUsage(view: Awaited<ReturnType<typeof testRender>>, text: string, id = "ui") {
-  await view.waitForFrame((frame) => frame.includes("▶ ") || !!view.renderer.root.findDescendantById(`skills-panel.${id}.agents`))
+  await view.waitForFrame(() => {
+    const toggle = view.renderer.root.findDescendantById(`skills-panel.${id}.toggle`)
+    return !!toggle && toggle.y > node(view, "skills-panel.header").y && toggle.width > 0
+  })
   if (!view.renderer.root.findDescendantById(`skills-panel.${id}.agents`)) await click(view, `skills-panel.${id}.toggle`)
   await view.waitForFrame((frame) => usagePattern(text).test(frame))
 }
 
+/** The sidebar groups local calls as Current; only the preview claims historical identity. */
+async function expectHistoricalUsage(view: Awaited<ReturnType<typeof testRender>>, host: any, text: string, absent?: RegExp) {
+  await click(view, "skills-panel.ui", 1)
+  const previewFrame = () => {
+    const preview = view.renderer.root.findDescendantById("skills-preview.agents")
+    return preview ? view.captureCharFrame().split("\n").slice(preview.y, preview.y + preview.height).join("\n") : ""
+  }
+  await view.waitForFrame(() => usagePattern(text).test(previewFrame()))
+  if (absent) assert.doesNotMatch(previewFrame(), absent)
+  host.close()
+  await view.flush()
+}
+
 test("expanded agent rows are informational; name still opens the existing preview", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3 · argus ×2")
+    await waitUsage(view, "Current ×5")
     assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
-    assert.match(view.captureCharFrame(), /▼ UI \(5 · 2 agents\)/)
-    assert.equal(node(view, "skills-panel.ui.agents").height, 2)
+    assert.match(view.captureCharFrame(), /• UI ▾5/)
+    assert.equal(node(view, "skills-panel.ui.agents").height, 1)
     await click(view, "skills-panel.ui.agents")
     assert.equal(host.dialog(), undefined)
     const row = node(view, "skills-panel.ui")
-    await view.mockMouse.click(row.x + 3, row.y)
+    await view.mockMouse.click(row.x + 3, row.y, 1)
     await view.waitForFrame((frame) => frame.includes("agents: (5 · 2 agents)"))
     await view.renderOnce()
     const pending: Promise<void>[] = []
@@ -307,19 +493,19 @@ test("completed child-only loads are paged recursively without importing sibling
   const requests: any[] = []
   await withUsage(async (view, host) => {
     await waitUsage(view, "explorer ×2 · nested ×1 · parallel ×1")
-    assert.match(view.captureCharFrame(), /UI \(4 · 3 agents\) \(subagent\)/)
-    assert.match(view.captureCharFrame(), /0 loaded/)
+    assert.match(view.captureCharFrame(), /• UI ▾4/)
+    assert.match(view.captureCharFrame(), /1 loaded/)
     assert.doesNotMatch(view.captureCharFrame(), /unrelated/)
     assert.ok(requests.some((input) => input.parentID === "s1" && input.cursor === "page2"))
-    await click(view, "skills-panel.ui")
+    await click(view, "skills-panel.ui", 1)
     await view.waitForFrame((frame) => frame.includes("agents: (4 · 3 agents)"))
     host.close()
     host.select("child")
-    await waitUsage(view, "explorer ×2 · nested ×1")
+    await waitUsage(view, "Current ×2 · nested ×1")
     assert.doesNotMatch(view.captureCharFrame(), /parallel/)
     assert.match(view.captureCharFrame(), /1 loaded/)
     host.select("s2")
-    await waitUsage(view, "unrelated ×1")
+    await waitUsage(view, "Current ×1")
     assert.doesNotMatch(view.captureCharFrame(), /explorer|nested|parallel/)
   }, {
     initialMessages: { s1: [], s2: [message("same", "unrelated")] },
@@ -347,7 +533,7 @@ test("late child discovery, duplicate delivery and resumed background history up
     count = 2
     host.emit("session.idle", { sessionID: "late" })
     await waitUsage(view, "explorer ×2")
-    assert.match(view.captureCharFrame(), /0 loaded/)
+    assert.match(view.captureCharFrame(), /1 loaded/)
   }, {
     initialMessages: { s1: [] },
     history: async ({ sessionID }) => ({ data: sessionID === "late" ? [message("m1", "explorer", count)] : [], cursor: {} }),
@@ -356,12 +542,12 @@ test("late child discovery, duplicate delivery and resumed background history up
 
 test("parent compaction and child compaction/revert have independent contributions", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "parent ×1 · explorer ×2")
+    await waitUsage(view, "Current ×1 · explorer ×2")
     host.setMessages("s1", [{ id: "c1", type: "compaction", status: "completed", time: { created: 10 } }])
     await waitUsage(view, "explorer ×2")
-    await view.waitForFrame((frame) => !/parent\s+×/.test(frame))
-    assert.doesNotMatch(view.captureCharFrame(), /parent\s+×/)
-    assert.match(view.captureCharFrame(), /0 loaded/)
+    assert.doesNotMatch(view.captureCharFrame(), /Current\s+×/)
+    await expectHistoricalUsage(view, host, "explorer ×2", /parent\s+×/)
+    assert.match(view.captureCharFrame(), /1 loaded/)
     host.setMessages("child", [{ id: "c2", type: "compaction", status: "completed", time: { created: 10 } }, message("new", "resumed", 1, 20)])
     await waitUsage(view, "resumed ×1")
     assert.doesNotMatch(view.captureCharFrame(), /explorer/)
@@ -376,13 +562,14 @@ test("parent compaction and child compaction/revert have independent contributio
 test("deleting a child discards late history and descendants without affecting the parent", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "parent ×1 · explorer ×1")
+    await waitUsage(view, "Current ×1 · explorer ×1")
     host.emit("session.deleted", { sessionID: "child" })
     await view.waitForFrame((frame) => !frame.includes("explorer"))
     pending.resolve({ data: [message("m1", "stale", 9)], cursor: {} })
     await view.flush()
-    assert.match(view.captureCharFrame(), /parent\s+×1/)
+    assert.match(view.captureCharFrame(), /Current\s+×1/)
     assert.doesNotMatch(view.captureCharFrame(), /stale|explorer|subagent/)
+    await expectHistoricalUsage(view, host, "parent ×1", /stale|explorer/)
   }, {
     sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
     initialMessages: { s1: [message("p", "parent")], child: [message("m1", "explorer")] },
@@ -390,14 +577,14 @@ test("deleting a child discards late history and descendants without affecting t
   })
 })
 
-test("history-only child loads survive parent permission filtering and loaded scope stays local", async () => {
+test("history-only child loads survive parent permission filtering; unknown loaded payload totals stay unknown", async () => {
   await withUsage(async (view) => {
     await waitUsage(view, "explorer ×1", "private-skill")
-    assert.match(view.captureCharFrame(), /private-skill \(1 · 1 agent\) \(subagent\)/)
+    assert.match(view.captureCharFrame(), /• private-skill ▾1/)
     assert.match(view.captureCharFrame(), /explorer\s+×1/)
     assert.doesNotMatch(view.captureCharFrame(), /explorer ×1 · subagent/)
-    assert.match(view.captureCharFrame(), /0 loaded/)
-    assert.match(view.captureCharFrame(), /~0 tok/)
+    assert.match(view.captureCharFrame(), /1 loaded/)
+    assert.equal(headerTokens(view), "-")
   }, {
     prefs: { scope: "loaded", token: "load-delta" },
     sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
@@ -447,7 +634,7 @@ test("cleanup discards discovery/history replies and does not continue paging", 
 test("deleting an empty intermediate bridge removes its worker's cached contribution", async () => {
   await withUsage(async (view, host) => {
     await waitUsage(view, "explorer ×1")
-    assert.match(view.captureCharFrame(), /UI \(1 · 1 agent\) \(subagent\)/)
+    assert.match(view.captureCharFrame(), /• UI ▾1/)
     host.emit("session.deleted", { sessionID: "bridge" })
     await view.flush()
     assert.doesNotMatch(view.captureCharFrame(), /explorer|subagent/)
@@ -462,7 +649,7 @@ test.each(["first-page", "partial-page", "repeated-cursor"])("child discovery re
   let recover = false
   const requests: any[] = []
   await withUsage(async (view, host) => {
-    await view.waitForFrame((frame) => frame.includes("0 loaded") && requests.filter((input) => input.parentID === "s1").length >= (failure === "first-page" ? 1 : 2))
+    await view.waitForFrame((frame) => frame.includes(failure === "first-page" ? "0 loaded" : "1 loaded") && requests.filter((input) => input.parentID === "s1").length >= (failure === "first-page" ? 1 : 2))
     await view.flush()
     const before = requests.filter((input) => input.parentID === "s1").length
     assert.equal(before, failure === "first-page" ? 1 : 2)
@@ -496,7 +683,7 @@ test("tool activity during pending child history queues one follow-up with resum
     pending.resolve({ data: [message("m1", "explorer")], cursor: {} })
     await waitUsage(view, "explorer ×2")
     assert.equal(reads, 2)
-    assert.match(view.captureCharFrame(), /0 loaded/)
+    assert.match(view.captureCharFrame(), /1 loaded/)
   }, {
     sessions: [{ id: "s1" }, { id: "child", parentID: "s1" }],
     initialMessages: { s1: [] },
@@ -543,7 +730,7 @@ test("known non-skill tool events and unrelated content edits do not rescan hist
 
 test("the new settings toggle hides only the sidebar line, not preview information or counting", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     assert.equal(host.settings.usage, "on")
     host.openSettings()
     await view.waitForFrame((frame) => frame.includes("Agent usage"))
@@ -554,18 +741,18 @@ test("the new settings toggle hides only the sidebar line, not preview informati
     assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.agents"))
     host.setMessages("s1", [message("m1", "unity-engineer", 4)])
     await view.flush()
-    await click(view, "skills-panel.ui")
+    await click(view, "skills-panel.ui", 1)
     await view.waitForFrame((frame) => frame.includes("agents: (6 · 2 agents)"))
     assert.match(view.captureCharFrame(), /unity-engineer\s+×4/)
-    assert.equal(host.settings.preview, "left-click")
+    assert.equal(host.settings.preview, "middle-click")
     assert.equal(host.settings.mention, "right-click")
   })
 })
 
 test("preview counts remain reactive without changing skill stats", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
-    await click(view, "skills-panel.ui")
+    await waitUsage(view, "Current ×5")
+    await click(view, "skills-panel.ui", 1)
     await view.waitForFrame((frame) => frame.includes("agents: (5 · 2 agents)"))
     const stats = view.captureCharFrame().split("\n").find((line) => line.includes("stats:"))
     host.setMessages("s1", [message("m1", "unity-engineer", 4), message("m2", "argus", 2)])
@@ -579,41 +766,44 @@ test("compaction clears counts and prevents a late history read from restoring o
   const pending = Promise.withResolvers<any>()
   let requests = 0
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     host.setMessages("s1", [{ id: "compact", type: "compaction", status: "completed" }, message("after", "argus")])
-    await waitUsage(view, "argus ×1")
+    await waitUsage(view, "Current ×1")
     pending.resolve({ data: [message("old-history", "stale-agent", 9)], cursor: {} })
     await view.flush()
     assert.doesNotMatch(view.captureCharFrame(), /stale-agent|unity-engineer/)
-    assert.match(view.captureCharFrame(), /argus\s+×1/)
+    assert.match(view.captureCharFrame(), /Current\s+×1/)
+    await expectHistoricalUsage(view, host, "argus ×1", /stale-agent|unity-engineer/)
   }, { history: async () => ++requests === 1 ? pending.promise : { data: [], cursor: {} } })
 })
 
 test("session switching does not aggregate other sessions or reassign historical agents", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     host.select("s2")
-    await waitUsage(view, "other-agent ×1")
+    await waitUsage(view, "Current ×1")
     assert.doesNotMatch(view.captureCharFrame(), /unity-engineer|argus/)
+    await expectHistoricalUsage(view, host, "other-agent ×1", /unity-engineer|argus/)
     host.select("s1")
-    await waitUsage(view, "unity-engineer ×3 · argus ×2")
+    await waitUsage(view, "Current ×5")
     assert.doesNotMatch(view.captureCharFrame(), /other-agent/)
+    await expectHistoricalUsage(view, host, "unity-engineer ×3 · argus ×2", /other-agent/)
   })
 })
 
-test("narrow rows wrap complete agent names and keep the original token column", async () => {
+test("narrow rows show current count and keep the original token column", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "argus ×2")
+    await waitUsage(view, "Current ×5")
     const row = node(view, "skills-panel.ui")
     const usage = node(view, "skills-panel.ui.agents")
     const tokens = node(view, "skills-panel.ui.tokens")
-    assert.match(view.captureCharFrame(), /unity-engineer\s+×3/)
+    assert.match(view.captureCharFrame(), /Current\s+×5/)
     assert.equal(usage.y, row.y + 1)
-    assert.ok(usage.height >= 2)
+    assert.equal(usage.height, 1)
     assert.equal(tokens.y, row.y)
     host.setThemeMode("light")
     await view.flush()
-    assert.ok(node(view, "skills-panel.ui.agents").height >= 2)
+    assert.equal(node(view, "skills-panel.ui.agents").height, 1)
     host.mutateSettings((draft: any) => { draft.usage = "off" })
     await view.flush()
     assert.ok(view.renderer.root.findDescendantById("skills-panel.ui.tokens"))
@@ -624,7 +814,7 @@ test("mixed parent and subagent usage stays readable without a redundant suffix"
   await withUsage(async (view) => {
     await waitUsage(view, "explorer ×1")
     const frame = view.captureCharFrame()
-    assert.match(frame, /orchestrator\s+×1/)
+    assert.match(frame, /Current\s+×1/)
     assert.doesNotMatch(frame, /subagent|\.\.\.|…/)
     assert.match(frame, /\(1\/1\)/)
     assert.ok(node(view, "skills-panel.ui.agents").height >= 2)
@@ -638,16 +828,17 @@ test("mixed parent and subagent usage stays readable without a redundant suffix"
 test("history-discovered compaction cannot be undone by a stale cached stage", async () => {
   let requests = 0
   await withUsage(async (view, host) => {
-    await waitUsage(view, "new-agent ×1")
+    await waitUsage(view, "Current ×1")
     assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
     host.setMessages("s1", [
       { id: "c1", type: "compaction", status: "completed", time: { created: 10 } },
       message("before", "old-agent", 3, 15),
     ])
     await view.flush()
-    assert.match(view.captureCharFrame(), /new-agent\s+×1/)
+    assert.match(view.captureCharFrame(), /Current\s+×1/)
     assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
     assert.equal(requests, 1)
+    await expectHistoricalUsage(view, host, "new-agent ×1", /old-agent/)
   }, {
     initialMessages: { s1: [
       { id: "c1", type: "compaction", status: "completed", time: { created: 10 } },
@@ -662,9 +853,10 @@ test("history-discovered compaction cannot be undone by a stale cached stage", a
 })
 
 test("a marker-less stale cache cannot restore pre-compaction usage", async () => {
-  await withUsage(async (view) => {
-    await waitUsage(view, "new-agent ×1")
+  await withUsage(async (view, host) => {
+    await waitUsage(view, "Current ×1")
     assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
+    await expectHistoricalUsage(view, host, "new-agent ×1", /old-agent/)
   }, {
     initialMessages: { s1: [message("before", "old-agent", 3, 15)] },
     history: async () => ({ data: [message("after", "new-agent", 1, 30),
@@ -675,24 +867,25 @@ test("a marker-less stale cache cannot restore pre-compaction usage", async () =
 test("late history preserves live updates that have left the current message window", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     host.setMessages("s1", [message("m1", "unity-engineer", 4), message("m2", "argus", 2)])
-    await waitUsage(view, "unity-engineer ×4")
+    await waitUsage(view, "Current ×6")
     host.setMessages("s1", [message("m2", "argus", 2)])
     await view.flush()
     pending.resolve({ data: [message("m2", "argus", 2), message("m1", "unity-engineer", 3)], cursor: {} })
     await Bun.sleep(0)
     await view.flush()
-    assert.match(view.captureCharFrame(), usagePattern("unity-engineer ×4 · argus ×2"))
+    assert.match(view.captureCharFrame(), usagePattern("Current ×6"))
+    await expectHistoricalUsage(view, host, "unity-engineer ×4 · argus ×2")
   }, { history: () => pending.promise })
 })
 
 test("late history cannot resurrect an emptied message after it leaves the live window", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     host.setMessages("s1", [message("m1", "unity-engineer", 0), message("m2", "argus", 2)])
-    await waitUsage(view, "argus ×2")
+    await waitUsage(view, "Current ×2")
     await view.waitForFrame((frame) => !frame.includes("unity-engineer"))
     assert.doesNotMatch(view.captureCharFrame(), /unity-engineer/)
     host.setMessages("s1", [message("m2", "argus", 2)])
@@ -701,23 +894,25 @@ test("late history cannot resurrect an emptied message after it leaves the live 
     await Bun.sleep(0)
     await view.flush()
     assert.doesNotMatch(view.captureCharFrame(), /unity-engineer/)
-    assert.match(view.captureCharFrame(), /argus\s+×2/)
+    assert.match(view.captureCharFrame(), /Current\s+×2/)
+    await expectHistoricalUsage(view, host, "argus ×2", /unity-engineer/)
   }, { history: () => pending.promise })
 })
 
 test("unchanged cached snapshots cannot overwrite fresher history on a later update", async () => {
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×4")
+    await waitUsage(view, "Current ×6")
     host.setMessages("s1", [message("m1", "unity-engineer", 3), message("m2", "argus", 2), message("m3", "argus")])
-    await waitUsage(view, "argus ×3")
-    assert.match(view.captureCharFrame(), /unity-engineer\s+×4/)
+    await waitUsage(view, "Current ×7")
+    await click(view, "skills-panel.ui", 1)
+    await view.waitForFrame((frame) => usagePattern("unity-engineer ×4 · argus ×3").test(frame))
   }, { history: async () => ({ data: [message("m2", "argus", 2), message("m1", "unity-engineer", 4)], cursor: {} }) })
 })
 
 test("deleting a session discards both counts and an in-flight history response", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     host.events.get("session.deleted")({ data: { sessionID: "s1" } })
     await view.flush()
     pending.resolve({ data: [message("m1", "unity-engineer", 3)], cursor: {} })
@@ -731,19 +926,21 @@ test.each([false, true])("history-discovered compaction retains evicted calls ob
   const pending = Promise.withResolvers<any>()
   const after = message("evicted", "build", 2, 30)
   await withUsage(async (view, host) => {
-    await waitUsage(view, beforeRequest ? "build ×2" : "old-agent ×1")
+    await waitUsage(view, beforeRequest ? "Current ×2" : "Current ×1")
     if (!beforeRequest) {
       host.setMessages("s1", [after])
-      await waitUsage(view, "build ×2")
+      await waitUsage(view, "Current ×3")
     }
     host.setMessages("s1", [message("current", "argus", 1, 40)])
-    await waitUsage(view, "argus ×1")
+    await waitUsage(view, beforeRequest ? "Current ×3" : "Current ×4")
     // The snapshot predates both post-compaction calls, and neither the old
     // marker nor the evicted build message remains in the current live window.
     pending.resolve({ data: [{ id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
     await Bun.sleep(0)
     await view.flush()
-    assert.match(view.captureCharFrame(), usagePattern("build ×2 · argus ×1"))
+    await waitUsage(view, "Current ×3")
+    await click(view, "skills-panel.ui", 1)
+    await view.waitForFrame((frame) => usagePattern("build ×2 · argus ×1").test(frame))
     assert.doesNotMatch(view.captureCharFrame(), /old-agent/)
     assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
   }, { initialMessages: { s1: [beforeRequest ? after : message("before", "old-agent", 1, 5)] }, history: () => pending.promise })
@@ -754,70 +951,77 @@ test("retaining evicted calls does not revive pre-boundary or unproven timestamp
   const stale = [5, 20, Number.NaN, Infinity].map((created, i) => message(`stale-${i}`, "stale-agent", 1, created))
   stale.push({ ...message("missing-time", "stale-agent"), time: {} as any })
   await withUsage(async (view, host) => {
-    await waitUsage(view, "stale-agent ×5")
+    await waitUsage(view, "Current ×5")
     host.setMessages("s1", [message("current", "argus", 1, 40)])
-    await waitUsage(view, "argus ×1")
+    await waitUsage(view, "Current ×6")
     pending.resolve({ data: [{ id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
     await Bun.sleep(0)
     await view.flush()
-    assert.match(view.captureCharFrame(), /argus\s+×1/)
+    await waitUsage(view, "Current ×1")
     assert.doesNotMatch(view.captureCharFrame(), /stale-agent/)
+    await expectHistoricalUsage(view, host, "argus ×1", /stale-agent/)
   }, { initialMessages: { s1: stale }, history: () => pending.promise })
 })
 
 test("evicted empty replacements still override history when it first reveals a boundary", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "build ×2")
+    await waitUsage(view, "Current ×2")
     host.setMessages("s1", [message("evicted", "build", 0, 30)])
-    await view.waitForFrame((frame) => !/build\s+×/.test(frame))
+    await view.waitForFrame((frame) => !frame.includes("▾2") && !frame.includes("▸2"))
+    assert.ok(!view.renderer.root.findDescendantById("skills-panel.ui.toggle"))
     host.setMessages("s1", [message("current", "argus", 1, 40)])
-    await waitUsage(view, "argus ×1")
+    await waitUsage(view, "Current ×1")
     pending.resolve({ data: [message("evicted", "build", 2, 30),
       { id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
     await Bun.sleep(0)
     await view.flush()
-    assert.match(view.captureCharFrame(), /argus\s+×1/)
+    assert.match(view.captureCharFrame(), /Current\s+×1/)
     assert.doesNotMatch(view.captureCharFrame(), /build\s+×/)
+    await expectHistoricalUsage(view, host, "argus ×1", /build\s+×/)
   }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
 })
 
 test("newer history wins over an evicted pre-request cache snapshot without double counting", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "build ×2")
+    await waitUsage(view, "Current ×2")
     host.setMessages("s1", [message("current", "argus", 1, 40)])
-    await waitUsage(view, "argus ×1")
+    await waitUsage(view, "Current ×3")
     pending.resolve({ data: [message("evicted", "build", 3, 30),
       { id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
     await Bun.sleep(0)
     await view.flush()
-    assert.match(view.captureCharFrame(), usagePattern("build ×3 · argus ×1"))
+    await waitUsage(view, "Current ×4")
+    await click(view, "skills-panel.ui", 1)
+    await view.waitForFrame((frame) => usagePattern("build ×3 · argus ×1").test(frame))
   }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
 })
 
 test("retained post-boundary invocations restore their loaded mark even with an empty current window", async () => {
   const pending = Promise.withResolvers<any>()
   await withUsage(async (view, host) => {
-    await waitUsage(view, "build ×2")
+    await waitUsage(view, "Current ×2")
     host.setMessages("s1", [])
     await view.flush()
     pending.resolve({ data: [{ id: "boundary", type: "compaction", status: "completed", time: { created: 20 } }], cursor: {} })
     await Bun.sleep(0)
     await view.flush()
-    assert.match(view.captureCharFrame(), /build\s+×2/)
+    assert.match(view.captureCharFrame(), /Current\s+×2/)
     assert.match(view.captureCharFrame(), /1 loaded · 1 visible/)
+    await expectHistoricalUsage(view, host, "build ×2")
   }, { initialMessages: { s1: [message("evicted", "build", 2, 30)] }, history: () => pending.promise })
 })
 
 test("committed reverts remove calls and load marks and rebuild retained history", async () => {
   let requests = 0
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3 · argus ×2")
+    await waitUsage(view, "Current ×5")
     host.commitRevert("s1", "m1")
-    await waitUsage(view, "older-agent ×1")
+    await waitUsage(view, "Current ×1")
     assert.doesNotMatch(view.captureCharFrame(), /unity-engineer|argus/)
     assert.equal(requests, 2)
+    await expectHistoricalUsage(view, host, "older-agent ×1", /unity-engineer|argus/)
     host.commitRevert("s1", "m0")
     await view.waitForFrame((frame) => frame.includes("0 loaded") && !frame.includes("older-agent"))
     assert.equal(requests, 3)
@@ -830,12 +1034,13 @@ test("a committed revert across compaction restores the earlier stage", async ()
   const boundary = { id: "m2", type: "compaction", status: "completed", time: { created: 20 } }
   const after = message("m3", "after-agent", 1, 30)
   await withUsage(async (view, host) => {
-    await waitUsage(view, "after-agent ×1")
+    await waitUsage(view, "Current ×1")
     host.commitRevert("s1", "m2")
-    await waitUsage(view, "before-agent ×2")
+    await waitUsage(view, "Current ×2")
     assert.doesNotMatch(view.captureCharFrame(), /after-agent/)
     assert.match(view.captureCharFrame(), /1 loaded/)
     assert.equal(requests, 2)
+    await expectHistoricalUsage(view, host, "before-agent ×2", /after-agent/)
   }, {
     initialMessages: { s1: [before, boundary, after] },
     history: async () => ({ data: ++requests === 1 ? [after, boundary] : [before], cursor: {} }),
@@ -846,12 +1051,13 @@ test("a committed revert invalidates in-flight history without affecting another
   const pending = Promise.withResolvers<any>()
   let requests = 0
   await withUsage(async (view, host) => {
-    await waitUsage(view, "unity-engineer ×3")
+    await waitUsage(view, "Current ×5")
     host.select("s2")
-    await waitUsage(view, "other-agent ×1")
+    await waitUsage(view, "Current ×1")
     host.commitRevert("s1", "m1")
     await view.flush()
-    assert.match(view.captureCharFrame(), /other-agent\s+×1/)
+    assert.match(view.captureCharFrame(), /Current\s+×1/)
+    await expectHistoricalUsage(view, host, "other-agent ×1", /unity-engineer|argus/)
     pending.resolve({ data: [message("m1", "stale-agent", 9)], cursor: {} })
     await Bun.sleep(0)
     host.select("s1")

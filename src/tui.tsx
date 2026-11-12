@@ -226,12 +226,12 @@ export default definePlugin({
   setup(ctx) {
     // Keep collapse per-terminal. Old in-memory settings seed the durable store on reload.
     const [ui, mutateUI] = ctx.storage.memory<Omit<SkillsSiderSettings, "token"> & { token: SkillsSiderSettings["token"] | "metadata" | "instructions"; collapsed: boolean; displayMode?: SkillDisplayMode }>("prefs", {
-      initial: { collapsed: false, switch: "on", scope: "model", preview: "left-click", mention: "right-click", token: "off", state: "on", usage: "on" },
+      initial: { collapsed: false, switch: "on", scope: "model", preview: "middle-click", mention: "right-click", token: "off", state: "on", usage: "on" },
     })
     const normalizeSettings = (value: Omit<typeof ui, "collapsed">): SkillsSiderSettings => ({
       switch: value.switch ?? "on",
       scope: value.scope ?? value.displayMode ?? "model",
-      preview: value.preview ?? "left-click",
+      preview: value.preview ?? "middle-click",
       mention: value.mention ?? "right-click",
       token: value.token === "metadata" ? "listing" : value.token === "instructions" ? "load-delta" : value.token ?? "off",
       state: value.state ?? "on",
@@ -328,8 +328,20 @@ export default definePlugin({
     }
     const familyUsage = (sessionID: string) => {
       const usage = new Map<string, readonly SkillInvocation[]>()
+      const sources = new Map<string, Map<string, { local: boolean; agentID: string | null; count: number }>>()
       for (const id of descendants(sessionID)) {
-        for (const [message, calls] of usageBySession().get(id) ?? []) usage.set(JSON.stringify([id, message]), calls)
+        for (const [message, calls] of usageBySession().get(id) ?? []) {
+          usage.set(JSON.stringify([id, message]), calls)
+          for (const call of calls) {
+            const local = id === sessionID
+            const key = JSON.stringify(local ? ["current"] : call.agentID === null ? ["unknown"] : ["agent", call.agentID])
+            let counts = sources.get(call.skillID)
+            if (!counts) sources.set(call.skillID, counts = new Map())
+            const source = counts.get(key)
+            if (source) source.count++
+            else counts.set(key, { local, agentID: call.agentID, count: 1 })
+          }
+        }
       }
       const localCallers = new Set<string>()
       for (const calls of usageBySession().get(sessionID)?.values() ?? []) {
@@ -338,7 +350,16 @@ export default definePlugin({
       const session = ctx.data.session.get(sessionID)
       const location = session?.location ?? ctx.location ?? ctx.data.location.default()
       const modes = new Map(ctx.data.location.agent.list(location)?.map((agent) => [agent.id, agent.mode]))
-      return countSkillUsage(usage, modes, localCallers)
+      const summaries = countSkillUsage(usage, modes, localCallers)
+      for (const [skill, counts] of sources) {
+        const summary = summaries.get(skill)
+        if (summary) summary.sources = [...counts.values()].map(({ local, agentID, count }) => ({
+          label: local ? "Current" : agentID === null ? "Unknown agent"
+            : agentID === "Current" || agentID === "Unknown agent" ? `Agent: ${agentID}` : agentID,
+          count,
+        }))
+      }
+      return summaries
     }
     const childLoads = (sessionID: string) => {
       const loaded = new Set<string>()
@@ -893,6 +914,8 @@ export default definePlugin({
             subagentLoadedIDs={subagentLoaded}
             emptyMessage={() => panel().emptyMessage}
             loadedIDs={() => loadedBySession().get(input.sessionID) ?? EMPTY_LOADED_SKILLS}
+            canToggleRow={() => settings().preview !== "left-click" && settings().mention !== "left-click"}
+            hasSelection={() => !!ctx.renderer.getSelection()?.getSelectedText()}
             theme={() => ctx.theme}
             themeMode={() => ctx.themeMode}
             collapsed={() => ui.collapsed}

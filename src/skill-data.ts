@@ -319,6 +319,7 @@ export interface AgentUsageCount {
 export interface SkillUsageSummary {
   total: number
   agents: AgentUsageCount[]
+  sources?: { label: string; count: number }[]
 }
 
 /** Shared structured evidence; classification never rewrites invocation identity. */
